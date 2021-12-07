@@ -15,7 +15,7 @@
 // Taken from https://github.com/signalfx/golib/blob/master/metadata/hostmetadata/host.go
 // with minor modifications.
 
-package hostmetadata
+package hostmetadata // import "github.com/open-telemetry/opentelemetry-collector-contrib/exporter/signalfxexporter/internal/hostmetadata"
 
 import (
 	"bytes"
@@ -28,9 +28,9 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/shirou/gopsutil/cpu"
-	"github.com/shirou/gopsutil/host"
-	"github.com/shirou/gopsutil/mem"
+	"github.com/shirou/gopsutil/v3/cpu"
+	"github.com/shirou/gopsutil/v3/host"
+	"github.com/shirou/gopsutil/v3/mem"
 )
 
 // etcPath is the path to host etc and can be set using the env var "HOST_ETC"

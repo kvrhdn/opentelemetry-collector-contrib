@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package awsxrayexporter
+package awsxrayexporter // import "github.com/open-telemetry/opentelemetry-collector-contrib/exporter/awsxrayexporter"
 
 import (
 	"context"
@@ -100,7 +100,7 @@ func newTracesExporter(
 func wrapErrorIfBadRequest(err *error) error {
 	_, ok := (*err).(awserr.RequestFailure)
 	if ok && (*err).(awserr.RequestFailure).StatusCode() < 500 {
-		return consumererror.Permanent(*err)
+		return consumererror.NewPermanent(*err)
 	}
 	return *err
 }

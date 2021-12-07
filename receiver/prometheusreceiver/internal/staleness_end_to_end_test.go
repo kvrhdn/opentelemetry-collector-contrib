@@ -24,6 +24,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/gogo/protobuf/proto"
 	"github.com/golang/snappy"
@@ -32,9 +33,9 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/collector/component"
+	"go.opentelemetry.io/collector/config/configmapprovider"
 	"go.opentelemetry.io/collector/processor/batchprocessor"
 	"go.opentelemetry.io/collector/service"
-	"go.opentelemetry.io/collector/service/parserprovider"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 
@@ -127,7 +128,8 @@ processors:
 exporters:
   prometheusremotewrite:
     endpoint: %q
-    insecure: true
+    tls:
+      insecure: true
 
 service:
   pipelines:
@@ -151,8 +153,8 @@ service:
 	}
 
 	appSettings := service.CollectorSettings{
-		Factories:      factories,
-		ParserProvider: parserprovider.NewInMemory(strings.NewReader(config)),
+		Factories:         factories,
+		ConfigMapProvider: configmapprovider.NewInMemory(strings.NewReader(config)),
 		BuildInfo: component.BuildInfo{
 			Command:     "otelcol",
 			Description: "OpenTelemetry Collector",
@@ -165,28 +167,25 @@ service:
 			}),
 		},
 	}
+
 	app, err := service.New(appSettings)
 	require.Nil(t, err)
 
 	go func() {
-		if err := app.Run(); err != nil {
+		if err = app.Run(context.Background()); err != nil {
 			t.Error(err)
 		}
 	}()
+	defer app.Shutdown()
 
 	// Wait until the collector has actually started.
-	stateChannel := app.GetStateChannel()
 	for notYetStarted := true; notYetStarted; {
-		switch state := <-stateChannel; state {
+		state := app.GetState()
+		switch state {
 		case service.Running, service.Closed, service.Closing:
 			notYetStarted = false
 		}
-	}
-
-	// The OpenTelemetry collector has a data race because it closes
-	// a channel while
-	if false {
-		defer app.Shutdown()
+		time.Sleep(10 * time.Millisecond)
 	}
 
 	// 5. Let's wait on 10 fetches.

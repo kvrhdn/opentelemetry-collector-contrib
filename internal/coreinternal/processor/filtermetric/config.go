@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package filtermetric
+package filtermetric // import "github.com/open-telemetry/opentelemetry-collector-contrib/internal/coreinternal/processor/filtermetric"
 
 import (
 	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/coreinternal/processor/filterconfig"
@@ -52,6 +52,6 @@ type MatchProperties struct {
 	Expressions []string `mapstructure:"expressions"`
 
 	// ResourceAttributes defines a list of possible resource attributes to match metrics against.
-	// A match occurs if any resource attribute matches at least one expression in this given list.
+	// A match occurs if any resource attribute matches all expressions in this given list.
 	ResourceAttributes []filterconfig.Attribute `mapstructure:"resource_attributes"`
 }

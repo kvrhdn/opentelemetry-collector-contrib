@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package datareceivers
+package datareceivers // import "github.com/open-telemetry/opentelemetry-collector-contrib/testbed/datareceivers"
 
 import (
 	"context"
@@ -69,7 +69,7 @@ func (sr *SFxMetricsDataReceiver) GenConfigYAMLStr() string {
 	// Note that this generates an exporter config for agent.
 	return fmt.Sprintf(`
     signalfx:
-      ingest_url: "http://localhost:%d/v2/datapoint"
+      ingest_url: "http://localhost:%d"
       api_url: "http://localhost/"
       access_token: "access_token"`, sr.Port)
 }

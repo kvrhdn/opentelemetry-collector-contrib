@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package zipkinreceiver
+package zipkinreceiver // import "github.com/open-telemetry/opentelemetry-collector-contrib/receiver/zipkinreceiver"
 
 import (
 	"compress/gzip"
@@ -26,7 +26,6 @@ import (
 	"strings"
 	"sync"
 
-	"go.opentelemetry.io/collector/client"
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/component/componenterror"
 	"go.opentelemetry.io/collector/config"
@@ -64,13 +63,13 @@ type zipkinReceiver struct {
 	protobufUnmarshaler      pdata.TracesUnmarshaler
 	protobufDebugUnmarshaler pdata.TracesUnmarshaler
 
-	settings component.TelemetrySettings
+	settings component.ReceiverCreateSettings
 }
 
 var _ http.Handler = (*zipkinReceiver)(nil)
 
 // newReceiver creates a new zipkinreceiver.zipkinReceiver reference.
-func newReceiver(config *Config, nextConsumer consumer.Traces, settings component.TelemetrySettings) (*zipkinReceiver, error) {
+func newReceiver(config *Config, nextConsumer consumer.Traces, settings component.ReceiverCreateSettings) (*zipkinReceiver, error) {
 	if nextConsumer == nil {
 		return nil, componenterror.ErrNilNextConsumer
 	}
@@ -95,10 +94,15 @@ func (zr *zipkinReceiver) Start(_ context.Context, host component.Host) error {
 		return errors.New("nil host")
 	}
 
+	var err error
 	zr.host = host
-	zr.server = zr.config.HTTPServerSettings.ToServer(zr, zr.settings)
+	zr.server, err = zr.config.HTTPServerSettings.ToServer(host, zr.settings.TelemetrySettings, zr)
+	if err != nil {
+		return err
+	}
+
 	var listener net.Listener
-	listener, err := zr.config.HTTPServerSettings.ToListener()
+	listener, err = zr.config.HTTPServerSettings.ToListener()
 	if err != nil {
 		return err
 	}
@@ -106,7 +110,7 @@ func (zr *zipkinReceiver) Start(_ context.Context, host component.Host) error {
 	go func() {
 		defer zr.shutdownWG.Done()
 
-		if errHTTP := zr.server.Serve(listener); errHTTP != http.ErrServerClosed {
+		if errHTTP := zr.server.Serve(listener); !errors.Is(errHTTP, http.ErrServerClosed) && errHTTP != nil {
 			host.ReportFatalError(errHTTP)
 		}
 	}()
@@ -198,15 +202,16 @@ const (
 // unmarshalls them and sends them along to the nextConsumer.
 func (zr *zipkinReceiver) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	if c, ok := client.FromHTTP(r); ok {
-		ctx = client.NewContext(ctx, c)
-	}
 
 	// Now deserialize and process the spans.
 	asZipkinv1 := r.URL != nil && strings.Contains(r.URL.Path, "api/v1/spans")
 
 	transportTag := transportType(r, asZipkinv1)
-	obsrecv := obsreport.NewReceiver(obsreport.ReceiverSettings{ReceiverID: zr.id, Transport: transportTag})
+	obsrecv := obsreport.NewReceiver(obsreport.ReceiverSettings{
+		ReceiverID:             zr.id,
+		Transport:              transportTag,
+		ReceiverCreateSettings: zr.settings,
+	})
 	ctx = obsrecv.StartTracesOp(ctx)
 
 	pr := processBodyIfNecessary(r)

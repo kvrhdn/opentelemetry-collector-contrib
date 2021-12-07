@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package deltatorateprocessor
+package deltatorateprocessor // import "github.com/open-telemetry/opentelemetry-collector-contrib/processor/deltatorateprocessor"
 
 import (
 	"context"
@@ -61,7 +61,7 @@ func (dtrp *deltaToRateProcessor) processMetrics(_ context.Context, md pdata.Met
 				if _, ok := dtrp.ConfiguredMetrics[metric.Name()]; !ok {
 					continue
 				}
-				if metric.DataType() != pdata.MetricDataTypeSum || metric.Sum().AggregationTemporality() != pdata.AggregationTemporalityDelta {
+				if metric.DataType() != pdata.MetricDataTypeSum || metric.Sum().AggregationTemporality() != pdata.MetricAggregationTemporalityDelta {
 					dtrp.logger.Info(fmt.Sprintf("Configured metric for rate calculation %s is not a delta sum\n", metric.Name()))
 					continue
 				}

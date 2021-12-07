@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package prometheusexecreceiver
+package prometheusexecreceiver // import "github.com/open-telemetry/opentelemetry-collector-contrib/receiver/prometheusexecreceiver"
 
 import (
 	"context"
@@ -124,7 +124,7 @@ func getPromReceiverConfig(cfg *Config) *prometheusreceiver.Config {
 	}
 
 	return &prometheusreceiver.Config{
-		ReceiverSettings: config.NewReceiverSettings(config.NewIDWithName(typeStr, cfg.ID().Name())),
+		ReceiverSettings: config.NewReceiverSettings(config.NewComponentIDWithName(typeStr, cfg.ID().Name())),
 		PrometheusConfig: &promconfig.Config{
 			ScrapeConfigs: []*promconfig.ScrapeConfig{scrapeConfig},
 		},
