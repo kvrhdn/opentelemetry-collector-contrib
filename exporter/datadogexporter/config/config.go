@@ -32,7 +32,6 @@ import (
 var (
 	errUnsetAPIKey = errors.New("api.key is not set")
 	errNoMetadata  = errors.New("only_metadata can't be enabled when send_metadata or use_resource_metadata is disabled")
-	errBuckets     = errors.New("'metrics::report_buckets' is obsolete. Use 'metrics::histograms::mode' instead")
 )
 
 // TODO: Import these from translator when we eliminate cyclic dependency.
@@ -153,6 +152,11 @@ type TracesConfig struct {
 	//   instrumentation:express.server: express
 	//   go.opentelemetry.io_contrib_instrumentation_net_http_otelhttp.client: http.client
 	SpanNameRemappings map[string]string `mapstructure:"span_name_remappings"`
+
+	// If set to true the OpenTelemetry span name will used in the Datadog resource name.
+	// If set to false the resource name will be filled with the instrumentation library name + span kind.
+	// The default value is `false`.
+	SpanNameAsResourceName bool `mapstructure:"span_name_as_resource_name"`
 }
 
 // TagsConfig defines the tag-related configuration
@@ -200,12 +204,25 @@ func (t *TagsConfig) GetHostTags() []string {
 	return tags
 }
 
+// LimitedTLSClientSetting is a subset of TLSClientSetting, see LimitedHTTPClientSettings for more details
+type LimitedTLSClientSettings struct {
+	// InsecureSkipVerify controls whether a client verifies the server's
+	// certificate chain and host name.
+	InsecureSkipVerify bool `mapstructure:"insecure_skip_verify"`
+}
+
+type LimitedHTTPClientSettings struct {
+	TLSSetting LimitedTLSClientSettings `mapstructure:"tls,omitempty"`
+}
+
 // Config defines configuration for the Datadog exporter.
 type Config struct {
 	config.ExporterSettings        `mapstructure:",squash"` // squash ensures fields are correctly decoded in embedded struct
 	exporterhelper.TimeoutSettings `mapstructure:",squash"` // squash ensures fields are correctly decoded in embedded struct.
 	exporterhelper.QueueSettings   `mapstructure:"sending_queue"`
 	exporterhelper.RetrySettings   `mapstructure:"retry_on_failure"`
+
+	LimitedHTTPClientSettings `mapstructure:",squash"`
 
 	TagsConfig `mapstructure:",squash"`
 
@@ -323,12 +340,6 @@ func (c *Config) Validate() error {
 }
 
 func (c *Config) Unmarshal(configMap *config.Map) error {
-	// metrics::report_buckets is obsolete, return an error to
-	// tell the user to use metrics::histograms::mode instead.
-	if configMap.IsSet("metrics::report_buckets") {
-		return errBuckets
-	}
-
 	err := configMap.UnmarshalExact(c)
 	if err != nil {
 		return err

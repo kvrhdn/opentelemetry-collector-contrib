@@ -97,7 +97,7 @@ func translatorFromConfig(logger *zap.Logger, cfg *config.Config) (*translator.T
 func newMetricsExporter(ctx context.Context, params component.ExporterCreateSettings, cfg *config.Config) (*metricsExporter, error) {
 	client := utils.CreateClient(cfg.API.Key, cfg.Metrics.TCPAddr.Endpoint)
 	client.ExtraHeader["User-Agent"] = utils.UserAgent(params.BuildInfo)
-	client.HttpClient = utils.NewHTTPClient(cfg.TimeoutSettings)
+	client.HttpClient = utils.NewHTTPClient(cfg.TimeoutSettings, cfg.LimitedHTTPClientSettings)
 
 	utils.ValidateAPIKey(params.Logger, client)
 
@@ -168,7 +168,6 @@ func (exp *metricsExporter) PushMetricsData(ctx context.Context, md pdata.Metric
 	}
 
 	consumer := metrics.NewConsumer()
-	consumer.ConsumeHost(metadata.GetHost(exp.params.Logger, exp.cfg))
 	pushTime := uint64(time.Now().UTC().UnixNano())
 	err := exp.tr.MapMetrics(ctx, md, consumer)
 	if err != nil {

@@ -22,63 +22,75 @@ import (
 
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/collector/model/pdata"
 	"go.uber.org/zap"
 
 	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/scrapertest"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/scrapertest/golden"
 )
+
+func TestUnsuccessfulScrape(t *testing.T) {
+	factory := NewFactory()
+	cfg := factory.CreateDefaultConfig().(*Config)
+	cfg.Endpoint = "fake:11111"
+
+	scraper := newPostgreSQLScraper(zap.NewNop(), cfg, &defaultClientFactory{})
+	actualMetrics, err := scraper.scrape(context.Background())
+	require.Error(t, err)
+
+	require.NoError(t, scrapertest.CompareMetrics(pdata.NewMetrics(), actualMetrics))
+}
 
 func TestScraper(t *testing.T) {
 	factory := new(mockClientFactory)
 	factory.initMocks([]string{"otel"})
-	sc := newPostgreSQLScraper(zap.NewNop(), &Config{Databases: []string{"otel"}}, factory)
 
-	scrapedRMS, err := sc.scrape(context.Background())
+	cfg := createDefaultConfig().(*Config)
+	cfg.Databases = []string{"otel"}
+	scraper := newPostgreSQLScraper(zap.NewNop(), cfg, factory)
+
+	actualMetrics, err := scraper.scrape(context.Background())
 	require.NoError(t, err)
 
 	expectedFile := filepath.Join("testdata", "scraper", "otel", "expected.json")
-	expectedMetrics, err := scrapertest.ReadExpected(expectedFile)
+	expectedMetrics, err := golden.ReadMetrics(expectedFile)
 	require.NoError(t, err)
 
-	eMetricSlice := expectedMetrics.ResourceMetrics().At(0).InstrumentationLibraryMetrics().At(0).Metrics()
-	aMetricSlice := scrapedRMS.ResourceMetrics().At(0).InstrumentationLibraryMetrics().At(0).Metrics()
-
-	require.NoError(t, scrapertest.CompareMetricSlices(eMetricSlice, aMetricSlice))
+	require.NoError(t, scrapertest.CompareMetrics(expectedMetrics, actualMetrics))
 }
 
 func TestScraperNoDatabaseSingle(t *testing.T) {
 	factory := new(mockClientFactory)
 	factory.initMocks([]string{"otel"})
-	sc := newPostgreSQLScraper(zap.NewNop(), &Config{}, factory)
 
-	scrapedRMS, err := sc.scrape(context.Background())
+	cfg := createDefaultConfig().(*Config)
+	scraper := newPostgreSQLScraper(zap.NewNop(), cfg, factory)
+
+	actualMetrics, err := scraper.scrape(context.Background())
 	require.NoError(t, err)
 
 	expectedFile := filepath.Join("testdata", "scraper", "otel", "expected.json")
-	expectedMetrics, err := scrapertest.ReadExpected(expectedFile)
+	expectedMetrics, err := golden.ReadMetrics(expectedFile)
 	require.NoError(t, err)
 
-	eMetricSlice := expectedMetrics.ResourceMetrics().At(0).InstrumentationLibraryMetrics().At(0).Metrics()
-	aMetricSlice := scrapedRMS.ResourceMetrics().At(0).InstrumentationLibraryMetrics().At(0).Metrics()
-
-	require.NoError(t, scrapertest.CompareMetricSlices(eMetricSlice, aMetricSlice))
+	require.NoError(t, scrapertest.CompareMetrics(expectedMetrics, actualMetrics))
 }
 
 func TestScraperNoDatabaseMultiple(t *testing.T) {
 	factory := mockClientFactory{}
 	factory.initMocks([]string{"otel", "open", "telemetry"})
-	sc := newPostgreSQLScraper(zap.NewNop(), &Config{}, &factory)
 
-	scrapedRMS, err := sc.scrape(context.Background())
+	cfg := createDefaultConfig().(*Config)
+	scraper := newPostgreSQLScraper(zap.NewNop(), cfg, &factory)
+
+	actualMetrics, err := scraper.scrape(context.Background())
 	require.NoError(t, err)
 
 	expectedFile := filepath.Join("testdata", "scraper", "multiple", "expected.json")
-	expectedMetrics, err := scrapertest.ReadExpected(expectedFile)
+	expectedMetrics, err := golden.ReadMetrics(expectedFile)
 	require.NoError(t, err)
 
-	eMetricSlice := expectedMetrics.ResourceMetrics().At(0).InstrumentationLibraryMetrics().At(0).Metrics()
-	aMetricSlice := scrapedRMS.ResourceMetrics().At(0).InstrumentationLibraryMetrics().At(0).Metrics()
-
-	require.NoError(t, scrapertest.CompareMetricSlices(eMetricSlice, aMetricSlice))
+	require.NoError(t, scrapertest.CompareMetrics(expectedMetrics, actualMetrics))
 }
 
 type mockClientFactory struct{ mock.Mock }

@@ -17,7 +17,7 @@ package main
 import (
 	"io/ioutil"
 	"os"
-	"path"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -28,12 +28,13 @@ const (
 name: metricreceiver
 metrics:
   system.cpu.time:
+    enabled: true
     description: Total CPU seconds broken down by different states.
     extended_documentation: Additional information on CPU Time can be found [here](https://en.wikipedia.org/wiki/CPU_time).
     unit: s
     sum:
       aggregation: cumulative
-      number_type: double
+      value_type: double
     attributes: []
 `
 )
@@ -74,7 +75,7 @@ func Test_runContents(t *testing.T) {
 				require.NoError(t, os.RemoveAll(tmpdir))
 			})
 
-			metadataFile := path.Join(tmpdir, "metadata.yaml")
+			metadataFile := filepath.Join(tmpdir, "metadata.yaml")
 			require.NoError(t, ioutil.WriteFile(metadataFile, []byte(tt.args.yml), 0600))
 
 			err = run(metadataFile, tt.args.useExpGen)
@@ -84,13 +85,13 @@ func Test_runContents(t *testing.T) {
 			} else {
 				require.NoError(t, err)
 
-				genFilePath := path.Join(tmpdir, "internal/metadata/generated_metrics.go")
+				genFilePath := filepath.Join(tmpdir, "internal/metadata/generated_metrics.go")
 				if tt.args.useExpGen {
-					genFilePath = path.Join(tmpdir, "internal/metadata/generated_metrics_v2.go")
+					genFilePath = filepath.Join(tmpdir, "internal/metadata/generated_metrics_v2.go")
 				}
 				require.FileExists(t, genFilePath)
 
-				require.FileExists(t, path.Join(tmpdir, "documentation.md"))
+				require.FileExists(t, filepath.Join(tmpdir, "documentation.md"))
 			}
 		})
 	}

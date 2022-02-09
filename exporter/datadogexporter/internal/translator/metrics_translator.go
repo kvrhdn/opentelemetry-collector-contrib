@@ -369,13 +369,8 @@ func (t *Translator) MapMetrics(ctx context.Context, md pdata.Metrics, consumer 
 	for i := 0; i < rms.Len(); i++ {
 		rm := rms.At(i)
 
-		var attributeTags []string
-
-		// Only fetch attribute tags if they're not already converted into labels.
-		// Otherwise some tags would be present twice in a metric's tag list.
-		if !t.cfg.ResourceAttributesAsTags {
-			attributeTags = attributes.TagsFromAttributes(rm.Resource().Attributes())
-		}
+		// Fetch tags from attributes.
+		attributeTags := attributes.TagsFromAttributes(rm.Resource().Attributes())
 
 		host, ok := attributes.HostnameFromAttributes(rm.Resource().Attributes())
 		if !ok {
@@ -386,9 +381,19 @@ func (t *Translator) MapMetrics(ctx context.Context, md pdata.Metrics, consumer 
 			}
 		}
 
-		// Track hosts if the consumer is a HostConsumer.
-		if c, ok := consumer.(HostConsumer); ok {
-			c.ConsumeHost(host)
+		if host != "" {
+			// Track hosts if the consumer is a HostConsumer.
+			if c, ok := consumer.(HostConsumer); ok {
+				c.ConsumeHost(host)
+			}
+		} else {
+			// Track task ARN if the consumer is a TagsConsumer.
+			if c, ok := consumer.(TagsConsumer); ok {
+				tags := attributes.RunningTagsFromAttributes(rm.Resource().Attributes())
+				for _, tag := range tags {
+					c.ConsumeTag(tag)
+				}
+			}
 		}
 
 		ilms := rm.InstrumentationLibraryMetrics()
