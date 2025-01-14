@@ -1,16 +1,5 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//       http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
 package prometheusreceiver
 
@@ -20,9 +9,9 @@ import (
 	"testing"
 	"time"
 
-	promcfg "github.com/prometheus/prometheus/config"
 	"github.com/stretchr/testify/assert"
-	"go.opentelemetry.io/collector/model/pdata"
+	"go.opentelemetry.io/collector/pdata/pcommon"
+	"go.opentelemetry.io/collector/pdata/pmetric"
 )
 
 var (
@@ -160,7 +149,7 @@ func TestHonorTimeStampsWithTrue(t *testing.T) {
 		},
 	}
 
-	testComponent(t, targets, false, "")
+	testComponent(t, targets, nil)
 }
 
 // TestHonorTimeStampsWithFalse validates that with honor_timestamp config set to false,
@@ -178,7 +167,7 @@ func TestHonorTimeStampsWithFalse(t *testing.T) {
 		},
 	}
 
-	testComponent(t, targets, false, "", func(cfg *promcfg.Config) {
+	testComponent(t, targets, nil, func(cfg *PromConfig) {
 		for _, scrapeConfig := range cfg.ScrapeConfigs {
 			scrapeConfig.HonorTimestamps = false
 		}
@@ -188,27 +177,27 @@ func TestHonorTimeStampsWithFalse(t *testing.T) {
 func setMetricsTimestamp() {
 	onlyOnce.Do(func() {
 		honorTimestampsPage1 = fmt.Sprintf(honorTimestampsPage1,
-			ts1,      //timestamp for gauge
-			ts2, ts3, //timestamp for counter
-			ts4, ts4, ts4, ts4, ts4, ts4, //timestamp for histogram
-			ts5, ts5, ts5, ts5, ts5, //timestamp for summary
+			ts1,      // timestamp for gauge
+			ts2, ts3, // timestamp for counter
+			ts4, ts4, ts4, ts4, ts4, ts4, // timestamp for histogram
+			ts5, ts5, ts5, ts5, ts5, // timestamp for summary
 		)
 		honorTimestampsPage2 = fmt.Sprintf(honorTimestampsPage2,
-			ts6,      //timestamp for gauge
-			ts7, ts8, //timestamp for counter
-			ts9, ts9, ts9, ts9, ts9, ts9, //timestamp for histogram
-			ts10, ts10, ts10, ts10, ts10, //timestamp for summary
+			ts6,      // timestamp for gauge
+			ts7, ts8, // timestamp for counter
+			ts9, ts9, ts9, ts9, ts9, ts9, // timestamp for histogram
+			ts10, ts10, ts10, ts10, ts10, // timestamp for summary
 		)
 		honorTimestampsPage3 = fmt.Sprintf(honorTimestampsPage3,
-			ts11,       //timestamp for gauge
-			ts12, ts13, //timestamp for counter
-			ts14, ts14, ts14, ts14, ts14, ts14, //timestamp for histogram
-			ts15, ts15, ts15, ts15, ts15, //timestamp for summary
+			ts11,       // timestamp for gauge
+			ts12, ts13, // timestamp for counter
+			ts14, ts14, ts14, ts14, ts14, ts14, // timestamp for histogram
+			ts15, ts15, ts15, ts15, ts15, // timestamp for summary
 		)
 	})
 }
 
-func verifyHonorTimeStampsTrue(t *testing.T, td *testData, resourceMetrics []*pdata.ResourceMetrics) {
+func verifyHonorTimeStampsTrue(t *testing.T, td *testData, resourceMetrics []pmetric.ResourceMetrics) {
 	verifyNumValidScrapeResults(t, td, resourceMetrics)
 	m1 := resourceMetrics[0]
 	// m1 has 4 metrics + 5 internal scraper metrics
@@ -217,53 +206,57 @@ func verifyHonorTimeStampsTrue(t *testing.T, td *testData, resourceMetrics []*pd
 	wantAttributes := td.attributes
 	e1 := []testExpectation{
 		assertMetricPresent("go_threads",
-			compareMetricType(pdata.MetricDataTypeGauge),
+			compareMetricType(pmetric.MetricTypeGauge),
+			compareMetricUnit(""),
 			[]dataPointExpectation{
 				{
 					numberPointComparator: []numberPointComparator{
-						compareTimestamp(pdata.NewTimestampFromTime(time.UnixMilli(ts1))),
+						compareTimestamp(pcommon.NewTimestampFromTime(time.UnixMilli(ts1))),
 						compareDoubleValue(19),
 					},
 				},
 			}),
 		assertMetricPresent("http_requests_total",
-			compareMetricType(pdata.MetricDataTypeSum),
+			compareMetricType(pmetric.MetricTypeSum),
+			compareMetricUnit(""),
 			[]dataPointExpectation{
 				{
 					numberPointComparator: []numberPointComparator{
-						compareStartTimestamp(pdata.NewTimestampFromTime(time.UnixMilli(ts2))),
-						compareTimestamp(pdata.NewTimestampFromTime(time.UnixMilli(ts2))),
+						compareStartTimestamp(pcommon.NewTimestampFromTime(time.UnixMilli(ts2))),
+						compareTimestamp(pcommon.NewTimestampFromTime(time.UnixMilli(ts2))),
 						compareDoubleValue(100),
 						compareAttributes(map[string]string{"method": "post", "code": "200"}),
 					},
 				},
 				{
 					numberPointComparator: []numberPointComparator{
-						compareStartTimestamp(pdata.NewTimestampFromTime(time.UnixMilli(ts3))),
-						compareTimestamp(pdata.NewTimestampFromTime(time.UnixMilli(ts3))),
+						compareStartTimestamp(pcommon.NewTimestampFromTime(time.UnixMilli(ts3))),
+						compareTimestamp(pcommon.NewTimestampFromTime(time.UnixMilli(ts3))),
 						compareDoubleValue(5),
 						compareAttributes(map[string]string{"method": "post", "code": "400"}),
 					},
 				},
 			}),
 		assertMetricPresent("http_request_duration_seconds",
-			compareMetricType(pdata.MetricDataTypeHistogram),
+			compareMetricType(pmetric.MetricTypeHistogram),
+			compareMetricUnit(""),
 			[]dataPointExpectation{
 				{
 					histogramPointComparator: []histogramPointComparator{
-						compareHistogramStartTimestamp(pdata.NewTimestampFromTime(time.UnixMilli(ts4))),
-						compareHistogramTimestamp(pdata.NewTimestampFromTime(time.UnixMilli(ts4))),
-						compareHistogram(2500, 5000, []uint64{1000, 500, 500, 500}),
+						compareHistogramStartTimestamp(pcommon.NewTimestampFromTime(time.UnixMilli(ts4))),
+						compareHistogramTimestamp(pcommon.NewTimestampFromTime(time.UnixMilli(ts4))),
+						compareHistogram(2500, 5000, []float64{0.05, 0.5, 1}, []uint64{1000, 500, 500, 500}),
 					},
 				},
 			}),
 		assertMetricPresent("rpc_duration_seconds",
-			compareMetricType(pdata.MetricDataTypeSummary),
+			compareMetricType(pmetric.MetricTypeSummary),
+			compareMetricUnit(""),
 			[]dataPointExpectation{
 				{
 					summaryPointComparator: []summaryPointComparator{
-						compareSummaryStartTimestamp(pdata.NewTimestampFromTime(time.UnixMilli(ts5))),
-						compareSummaryTimestamp(pdata.NewTimestampFromTime(time.UnixMilli(ts5))),
+						compareSummaryStartTimestamp(pcommon.NewTimestampFromTime(time.UnixMilli(ts5))),
+						compareSummaryTimestamp(pcommon.NewTimestampFromTime(time.UnixMilli(ts5))),
 						compareSummary(1000, 5000, [][]float64{{0.01, 1}, {0.9, 5}, {0.99, 8}}),
 					},
 				},
@@ -277,53 +270,57 @@ func verifyHonorTimeStampsTrue(t *testing.T, td *testData, resourceMetrics []*pd
 
 	e2 := []testExpectation{
 		assertMetricPresent("go_threads",
-			compareMetricType(pdata.MetricDataTypeGauge),
+			compareMetricType(pmetric.MetricTypeGauge),
+			compareMetricUnit(""),
 			[]dataPointExpectation{
 				{
 					numberPointComparator: []numberPointComparator{
-						compareTimestamp(pdata.NewTimestampFromTime(time.UnixMilli(ts6))),
+						compareTimestamp(pcommon.NewTimestampFromTime(time.UnixMilli(ts6))),
 						compareDoubleValue(18),
 					},
 				},
 			}),
 		assertMetricPresent("http_requests_total",
-			compareMetricType(pdata.MetricDataTypeSum),
+			compareMetricType(pmetric.MetricTypeSum),
+			compareMetricUnit(""),
 			[]dataPointExpectation{
 				{
 					numberPointComparator: []numberPointComparator{
-						compareStartTimestamp(pdata.NewTimestampFromTime(time.UnixMilli(ts7))),
-						compareTimestamp(pdata.NewTimestampFromTime(time.UnixMilli(ts7))),
+						compareStartTimestamp(pcommon.NewTimestampFromTime(time.UnixMilli(ts7))),
+						compareTimestamp(pcommon.NewTimestampFromTime(time.UnixMilli(ts7))),
 						compareDoubleValue(99),
 						compareAttributes(map[string]string{"method": "post", "code": "200"}),
 					},
 				},
 				{
 					numberPointComparator: []numberPointComparator{
-						compareStartTimestamp(pdata.NewTimestampFromTime(time.UnixMilli(ts8))),
-						compareTimestamp(pdata.NewTimestampFromTime(time.UnixMilli(ts8))),
+						compareStartTimestamp(pcommon.NewTimestampFromTime(time.UnixMilli(ts8))),
+						compareTimestamp(pcommon.NewTimestampFromTime(time.UnixMilli(ts8))),
 						compareDoubleValue(3),
 						compareAttributes(map[string]string{"method": "post", "code": "400"}),
 					},
 				},
 			}),
 		assertMetricPresent("http_request_duration_seconds",
-			compareMetricType(pdata.MetricDataTypeHistogram),
+			compareMetricType(pmetric.MetricTypeHistogram),
+			compareMetricUnit(""),
 			[]dataPointExpectation{
 				{
 					histogramPointComparator: []histogramPointComparator{
-						compareHistogramStartTimestamp(pdata.NewTimestampFromTime(time.UnixMilli(ts9))),
-						compareHistogramTimestamp(pdata.NewTimestampFromTime(time.UnixMilli(ts9))),
-						compareHistogram(2400, 4950, []uint64{900, 500, 500, 500}),
+						compareHistogramStartTimestamp(pcommon.NewTimestampFromTime(time.UnixMilli(ts9))),
+						compareHistogramTimestamp(pcommon.NewTimestampFromTime(time.UnixMilli(ts9))),
+						compareHistogram(2400, 4950, []float64{0.05, 0.5, 1}, []uint64{900, 500, 500, 500}),
 					},
 				},
 			}),
 		assertMetricPresent("rpc_duration_seconds",
-			compareMetricType(pdata.MetricDataTypeSummary),
+			compareMetricType(pmetric.MetricTypeSummary),
+			compareMetricUnit(""),
 			[]dataPointExpectation{
 				{
 					summaryPointComparator: []summaryPointComparator{
-						compareSummaryStartTimestamp(pdata.NewTimestampFromTime(time.UnixMilli(ts10))),
-						compareSummaryTimestamp(pdata.NewTimestampFromTime(time.UnixMilli(ts10))),
+						compareSummaryStartTimestamp(pcommon.NewTimestampFromTime(time.UnixMilli(ts10))),
+						compareSummaryTimestamp(pcommon.NewTimestampFromTime(time.UnixMilli(ts10))),
 						compareSummary(900, 4980, [][]float64{{0.01, 1}, {0.9, 6}, {0.99, 8}}),
 					},
 				},
@@ -337,53 +334,57 @@ func verifyHonorTimeStampsTrue(t *testing.T, td *testData, resourceMetrics []*pd
 
 	e3 := []testExpectation{
 		assertMetricPresent("go_threads",
-			compareMetricType(pdata.MetricDataTypeGauge),
+			compareMetricType(pmetric.MetricTypeGauge),
+			compareMetricUnit(""),
 			[]dataPointExpectation{
 				{
 					numberPointComparator: []numberPointComparator{
-						compareTimestamp(pdata.NewTimestampFromTime(time.UnixMilli(ts11))),
+						compareTimestamp(pcommon.NewTimestampFromTime(time.UnixMilli(ts11))),
 						compareDoubleValue(19),
 					},
 				},
 			}),
 		assertMetricPresent("http_requests_total",
-			compareMetricType(pdata.MetricDataTypeSum),
+			compareMetricType(pmetric.MetricTypeSum),
+			compareMetricUnit(""),
 			[]dataPointExpectation{
 				{
 					numberPointComparator: []numberPointComparator{
-						compareStartTimestamp(pdata.NewTimestampFromTime(time.UnixMilli(ts7))),
-						compareTimestamp(pdata.NewTimestampFromTime(time.UnixMilli(ts12))),
+						compareStartTimestamp(pcommon.NewTimestampFromTime(time.UnixMilli(ts7))),
+						compareTimestamp(pcommon.NewTimestampFromTime(time.UnixMilli(ts12))),
 						compareDoubleValue(100),
 						compareAttributes(map[string]string{"method": "post", "code": "200"}),
 					},
 				},
 				{
 					numberPointComparator: []numberPointComparator{
-						compareStartTimestamp(pdata.NewTimestampFromTime(time.UnixMilli(ts8))),
-						compareTimestamp(pdata.NewTimestampFromTime(time.UnixMilli(ts13))),
+						compareStartTimestamp(pcommon.NewTimestampFromTime(time.UnixMilli(ts8))),
+						compareTimestamp(pcommon.NewTimestampFromTime(time.UnixMilli(ts13))),
 						compareDoubleValue(5),
 						compareAttributes(map[string]string{"method": "post", "code": "400"}),
 					},
 				},
 			}),
 		assertMetricPresent("http_request_duration_seconds",
-			compareMetricType(pdata.MetricDataTypeHistogram),
+			compareMetricType(pmetric.MetricTypeHistogram),
+			compareMetricUnit(""),
 			[]dataPointExpectation{
 				{
 					histogramPointComparator: []histogramPointComparator{
-						compareHistogramStartTimestamp(pdata.NewTimestampFromTime(time.UnixMilli(ts9))),
-						compareHistogramTimestamp(pdata.NewTimestampFromTime(time.UnixMilli(ts14))),
-						compareHistogram(2500, 5000, []uint64{1000, 500, 500, 500}),
+						compareHistogramStartTimestamp(pcommon.NewTimestampFromTime(time.UnixMilli(ts9))),
+						compareHistogramTimestamp(pcommon.NewTimestampFromTime(time.UnixMilli(ts14))),
+						compareHistogram(2500, 5000, []float64{0.05, 0.5, 1}, []uint64{1000, 500, 500, 500}),
 					},
 				},
 			}),
 		assertMetricPresent("rpc_duration_seconds",
-			compareMetricType(pdata.MetricDataTypeSummary),
+			compareMetricType(pmetric.MetricTypeSummary),
+			compareMetricUnit(""),
 			[]dataPointExpectation{
 				{
 					summaryPointComparator: []summaryPointComparator{
-						compareSummaryStartTimestamp(pdata.NewTimestampFromTime(time.UnixMilli(ts10))),
-						compareSummaryTimestamp(pdata.NewTimestampFromTime(time.UnixMilli(ts15))),
+						compareSummaryStartTimestamp(pcommon.NewTimestampFromTime(time.UnixMilli(ts10))),
+						compareSummaryTimestamp(pcommon.NewTimestampFromTime(time.UnixMilli(ts15))),
 						compareSummary(1000, 5000, [][]float64{{0.01, 1}, {0.9, 5}, {0.99, 8}}),
 					},
 				},
@@ -392,7 +393,7 @@ func verifyHonorTimeStampsTrue(t *testing.T, td *testData, resourceMetrics []*pd
 	doCompare(t, "scrape-honorTimestamp-3", wantAttributes, m3, e3)
 }
 
-func verifyHonorTimeStampsFalse(t *testing.T, td *testData, resourceMetrics []*pdata.ResourceMetrics) {
+func verifyHonorTimeStampsFalse(t *testing.T, td *testData, resourceMetrics []pmetric.ResourceMetrics) {
 	verifyNumValidScrapeResults(t, td, resourceMetrics)
 	m1 := resourceMetrics[0]
 
@@ -401,11 +402,12 @@ func verifyHonorTimeStampsFalse(t *testing.T, td *testData, resourceMetrics []*p
 
 	wantAttributes := td.attributes
 
-	metrics1 := m1.InstrumentationLibraryMetrics().At(0).Metrics()
+	metrics1 := m1.ScopeMetrics().At(0).Metrics()
 	ts1 := getTS(metrics1)
 	e1 := []testExpectation{
 		assertMetricPresent("go_threads",
-			compareMetricType(pdata.MetricDataTypeGauge),
+			compareMetricType(pmetric.MetricTypeGauge),
+			compareMetricUnit(""),
 			[]dataPointExpectation{
 				{
 					numberPointComparator: []numberPointComparator{
@@ -415,7 +417,8 @@ func verifyHonorTimeStampsFalse(t *testing.T, td *testData, resourceMetrics []*p
 				},
 			}),
 		assertMetricPresent("http_requests_total",
-			compareMetricType(pdata.MetricDataTypeSum),
+			compareMetricType(pmetric.MetricTypeSum),
+			compareMetricUnit(""),
 			[]dataPointExpectation{
 				{
 					numberPointComparator: []numberPointComparator{
@@ -435,18 +438,20 @@ func verifyHonorTimeStampsFalse(t *testing.T, td *testData, resourceMetrics []*p
 				},
 			}),
 		assertMetricPresent("http_request_duration_seconds",
-			compareMetricType(pdata.MetricDataTypeHistogram),
+			compareMetricType(pmetric.MetricTypeHistogram),
+			compareMetricUnit(""),
 			[]dataPointExpectation{
 				{
 					histogramPointComparator: []histogramPointComparator{
 						compareHistogramStartTimestamp(ts1),
 						compareHistogramTimestamp(ts1),
-						compareHistogram(2500, 5000, []uint64{1000, 500, 500, 500}),
+						compareHistogram(2500, 5000, []float64{0.05, 0.5, 1}, []uint64{1000, 500, 500, 500}),
 					},
 				},
 			}),
 		assertMetricPresent("rpc_duration_seconds",
-			compareMetricType(pdata.MetricDataTypeSummary),
+			compareMetricType(pmetric.MetricTypeSummary),
+			compareMetricUnit(""),
 			[]dataPointExpectation{
 				{
 					summaryPointComparator: []summaryPointComparator{
@@ -463,11 +468,12 @@ func verifyHonorTimeStampsFalse(t *testing.T, td *testData, resourceMetrics []*p
 	// m2 has 4 metrics + 5 internal scraper metrics
 	assert.Equal(t, 9, metricsCount(m2))
 
-	metricsScrape2 := m2.InstrumentationLibraryMetrics().At(0).Metrics()
+	metricsScrape2 := m2.ScopeMetrics().At(0).Metrics()
 	ts2 := getTS(metricsScrape2)
 	e2 := []testExpectation{
 		assertMetricPresent("go_threads",
-			compareMetricType(pdata.MetricDataTypeGauge),
+			compareMetricType(pmetric.MetricTypeGauge),
+			compareMetricUnit(""),
 			[]dataPointExpectation{
 				{
 					numberPointComparator: []numberPointComparator{
@@ -477,7 +483,8 @@ func verifyHonorTimeStampsFalse(t *testing.T, td *testData, resourceMetrics []*p
 				},
 			}),
 		assertMetricPresent("http_requests_total",
-			compareMetricType(pdata.MetricDataTypeSum),
+			compareMetricType(pmetric.MetricTypeSum),
+			compareMetricUnit(""),
 			[]dataPointExpectation{
 				{
 					numberPointComparator: []numberPointComparator{
@@ -497,18 +504,20 @@ func verifyHonorTimeStampsFalse(t *testing.T, td *testData, resourceMetrics []*p
 				},
 			}),
 		assertMetricPresent("http_request_duration_seconds",
-			compareMetricType(pdata.MetricDataTypeHistogram),
+			compareMetricType(pmetric.MetricTypeHistogram),
+			compareMetricUnit(""),
 			[]dataPointExpectation{
 				{
 					histogramPointComparator: []histogramPointComparator{
 						compareHistogramStartTimestamp(ts2),
 						compareHistogramTimestamp(ts2),
-						compareHistogram(2400, 4950, []uint64{900, 500, 500, 500}),
+						compareHistogram(2400, 4950, []float64{0.05, 0.5, 1}, []uint64{900, 500, 500, 500}),
 					},
 				},
 			}),
 		assertMetricPresent("rpc_duration_seconds",
-			compareMetricType(pdata.MetricDataTypeSummary),
+			compareMetricType(pmetric.MetricTypeSummary),
+			compareMetricUnit(""),
 			[]dataPointExpectation{
 				{
 					summaryPointComparator: []summaryPointComparator{

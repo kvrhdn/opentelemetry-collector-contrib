@@ -10,7 +10,7 @@ Date: July 30, 2020
 
 Prometheus can be integrated with remote storage systems that supports its remote write API. Existing remote storage integration support is included in [Cortex](https://cortexmetrics.io/docs/api/), [influxDB](https://docs.influxdata.com/influxdb/v1.8/supported_protocols/prometheus/), and many [others](https://prometheus.io/docs/operating/integrations/#remote-endpoints-and-storage).
 
-The following diagram shows an example of Prometheus remote write API usage, with Cortex,n open source, horizontally scalable, highly available, multi-tenant, long term storage, as a remote storage backend.
+The following diagram shows an example of Prometheus remote write API usage, with Cortex, an open source, horizontally scalable, highly available, multi-tenant, long term storage, as a remote storage backend.
 
 ![Cortex Architecture](img/cortex.png)
 
@@ -34,7 +34,7 @@ Currently, metrics from the OpenTelemetry SDKs cannot be exported to Prometheus 
 
 To overcome this gap in the Collector pipeline, we had proposed 2 different solutions:
 
-1. Add a [metric aggregation processor](https://github.com/open-telemetry/opentelemetry-collector/issues/1422) to the collector pipeline to aggregate delta values into cumulative values for cumulative backends. This solution requires users to set up a collector agent next to each SDK to make sure delta values are aggregated correctly.
+1. Add a [metric aggregation processor](https://github.com/open-telemetry/opentelemetry-collector-contrib/issues/4968) to the collector pipeline to aggregate delta values into cumulative values for cumulative backends. This solution requires users to set up a collector agent next to each SDK to make sure delta values are aggregated correctly.
 2. Require the OTLP exporters in SDKs to [send cumulative values for cumulative metric types to the Collector by default](https://github.com/open-telemetry/opentelemetry-specification/issues/731). Therefore, no aggregation of delta metric values is required in the Collector pipeline for Prometheus/storage backends to properly process the data. 
 
 **Gap 2:**
@@ -45,10 +45,10 @@ Because of the gaps mentioned above, this project will convert from the current 
 
 ## **2. Prometheus Remote Write/Cortex Exporter**
 
-The Prometheus remote write/Cortex exporter should receive  OTLP metrics, group data points by metric name and label set, convert each group to a TimeSeries, and send all TimeSeries to a storage backend via HTTP.
+The Prometheus remote write/Cortex exporter should receive OTLP metrics, group data points by metric name and label set, convert each group to a TimeSeries, and send all TimeSeries to a storage backend via HTTP.
 
 ### **2.1 Receiving Metrics**
-The  Prometheus remote write/Cortex exporter receives a MetricsData instance in its PushMetrics() function. MetricsData contains a collection of Metric instances. Each Metric instance contains a series of data points, and each data point has a set of labels associated with it. Since Prometheus remote write TimeSeries are identified by unique sets of labels, the exporter needs to group data points within each Metric instance by their label set, and convert each group to a TimeSeries.
+The Prometheus remote write/Cortex exporter receives a MetricsData instance in its PushMetrics() function. MetricsData contains a collection of Metric instances. Each Metric instance contains a series of data points, and each data point has a set of labels associated with it. Since Prometheus remote write TimeSeries are identified by unique sets of labels, the exporter needs to group data points within each Metric instance by their label set, and convert each group to a TimeSeries.
 
 To group data points by label set, the exporter should create a map with each PushMetrics() call. The key of the map should represent a combination of the following information:
 
@@ -67,7 +67,7 @@ The value of the map should be Prometheus TimeSeries, and each data point’s va
 
 Pseudocode:
 
-        func  PushMetrics(metricsData) {
+        func PushMetrics(metricsData) {
 
          // Create a map that stores distinct TimeSeries
          map := make(map[String][]TimeSeries)
@@ -81,7 +81,7 @@ Pseudocode:
 	           // Add to TimeSeries
 
 	      // Sends TimeSeries to backend
-          export(map)  
+          export(map)
        }
 
 ### **2.2 Mapping of OTLP Metrics to TimeSeries**
@@ -280,7 +280,7 @@ We will follow test-driven development practices while completing this project. 
 
 
 ## **Request for Feedback**
-We'd like to get some feedback on whether we made the appropriate assumptions in [this](#1.2-gaps-and-assumptions) section, and appreciate more comments, updates , and suggestions on the topic.
+We'd like to get some feedback on whether we made the appropriate assumptions in [this](#12-gaps-and-assumptions) section, and appreciate more comments, updates , and suggestions on the topic.
 
 Please let us know if there are any revisions, technical or informational, necessary for this document. Thank you!
 

@@ -1,56 +1,44 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//       http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
 package processesscraper // import "github.com/open-telemetry/opentelemetry-collector-contrib/receiver/hostmetricsreceiver/internal/scraper/processesscraper"
 
 import (
 	"context"
 
-	"go.opentelemetry.io/collector/receiver/scraperhelper"
-	"go.uber.org/zap"
+	"go.opentelemetry.io/collector/component"
+	"go.opentelemetry.io/collector/receiver"
+	"go.opentelemetry.io/collector/scraper"
 
-	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/hostmetricsreceiver/internal"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/hostmetricsreceiver/internal/scraper/processesscraper/internal/metadata"
 )
 
 // This file implements Factory for Processes scraper.
 
-const (
-	// TypeStr the value of "type" key in configuration.
-	TypeStr = "processes"
-)
+// Type the value of "type" key in configuration.
+var Type = component.MustNewType("processes")
 
 // Factory is the Factory for scraper.
-type Factory struct {
-}
+type Factory struct{}
 
 // CreateDefaultConfig creates the default configuration for the Scraper.
-func (f *Factory) CreateDefaultConfig() internal.Config {
-	return &Config{}
+func (f *Factory) CreateDefaultConfig() component.Config {
+	return &Config{
+		MetricsBuilderConfig: metadata.DefaultMetricsBuilderConfig(),
+	}
 }
 
 // CreateMetricsScraper creates a scraper based on provided config.
 func (f *Factory) CreateMetricsScraper(
 	ctx context.Context,
-	_ *zap.Logger,
-	config internal.Config,
-) (scraperhelper.Scraper, error) {
+	settings receiver.Settings,
+	config component.Config,
+) (scraper.Metrics, error) {
 	cfg := config.(*Config)
-	s := newProcessesScraper(ctx, cfg)
+	s := newProcessesScraper(ctx, settings, cfg)
 
-	return scraperhelper.NewScraper(
-		TypeStr,
+	return scraper.NewMetrics(
 		s.scrape,
-		scraperhelper.WithStart(s.start),
+		scraper.WithStart(s.start),
 	)
 }

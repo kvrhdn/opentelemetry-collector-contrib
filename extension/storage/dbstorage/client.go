@@ -1,16 +1,5 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
 package dbstorage // import "github.com/open-telemetry/opentelemetry-collector-contrib/extension/storage/dbstorage"
 
@@ -21,17 +10,18 @@ import (
 	"fmt"
 
 	// Postgres driver
-	_ "github.com/jackc/pgx/v4/stdlib"
+	_ "github.com/jackc/pgx/v5/stdlib"
 	// SQLite driver
 	_ "github.com/mattn/go-sqlite3"
-	"go.opentelemetry.io/collector/extension/experimental/storage"
+	"go.opentelemetry.io/collector/extension/xextension/storage"
 )
 
 const (
-	createTable     = "create table if not exists %s (key text primary key, value blob)"
-	getQueryText    = "select value from %s where key=?"
-	setQueryText    = "insert into %s(key, value) values(?,?) on conflict(key) do update set value=?"
-	deleteQueryText = "delete from %s where key=?"
+	createTableSqlite = "create table if not exists %s (key text primary key, value blob)"
+	createTable       = "create table if not exists %s (key text primary key, value text)"
+	getQueryText      = "select value from %s where key=$1"
+	setQueryText      = "insert into %s(key, value) values($1,$2) on conflict(key) do update set value=$3"
+	deleteQueryText   = "delete from %s where key=$1"
 )
 
 type dbStorageClient struct {
@@ -41,9 +31,13 @@ type dbStorageClient struct {
 	deleteQuery *sql.Stmt
 }
 
-func newClient(ctx context.Context, db *sql.DB, tableName string) (*dbStorageClient, error) {
+func newClient(ctx context.Context, driverName string, db *sql.DB, tableName string) (*dbStorageClient, error) {
+	createTableSQL := createTable
+	if driverName == "sqlite" {
+		createTableSQL = createTableSqlite
+	}
 	var err error
-	_, err = db.ExecContext(ctx, fmt.Sprintf(createTable, tableName))
+	_, err = db.ExecContext(ctx, fmt.Sprintf(createTableSQL, tableName))
 	if err != nil {
 		return nil, err
 	}
@@ -94,7 +88,7 @@ func (c *dbStorageClient) Delete(ctx context.Context, key string) error {
 }
 
 // Batch executes the specified operations in order. Get operation results are updated in place
-func (c *dbStorageClient) Batch(ctx context.Context, ops ...storage.Operation) error {
+func (c *dbStorageClient) Batch(ctx context.Context, ops ...*storage.Operation) error {
 	var err error
 	for _, op := range ops {
 		switch op.Type {
@@ -123,8 +117,5 @@ func (c *dbStorageClient) Close(_ context.Context) error {
 	if err := c.deleteQuery.Close(); err != nil {
 		return err
 	}
-	if err := c.getQuery.Close(); err != nil {
-		return err
-	}
-	return nil
+	return c.getQuery.Close()
 }

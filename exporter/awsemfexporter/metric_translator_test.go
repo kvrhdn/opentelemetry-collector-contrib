@@ -1,286 +1,111 @@
-// Copyright 2020, OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
 
 package awsemfexporter
 
 import (
-	"io/ioutil"
+	"fmt"
+	"reflect"
 	"sort"
-	"strings"
 	"testing"
 	"time"
 
-	commonpb "github.com/census-instrumentation/opencensus-proto/gen-go/agent/common/v1"
-	agentmetricspb "github.com/census-instrumentation/opencensus-proto/gen-go/agent/metrics/v1"
-	metricspb "github.com/census-instrumentation/opencensus-proto/gen-go/metrics/v1"
-	resourcepb "github.com/census-instrumentation/opencensus-proto/gen-go/resource/v1"
-	"github.com/golang/protobuf/ptypes/timestamp"
-	"github.com/golang/protobuf/ptypes/wrappers"
 	"github.com/stretchr/testify/assert"
-	"go.opentelemetry.io/collector/model/pdata"
-	conventions "go.opentelemetry.io/collector/model/semconv/v1.5.0"
+	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/collector/pdata/pcommon"
+	"go.opentelemetry.io/collector/pdata/pmetric"
+	conventions "go.opentelemetry.io/collector/semconv/v1.27.0"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"go.uber.org/zap/zaptest/observer"
 
-	internaldata "github.com/open-telemetry/opentelemetry-collector-contrib/pkg/translator/opencensus"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/coreinternal/occonventions"
 )
 
-func readFromFile(filename string) string {
-	data, err := ioutil.ReadFile(filename)
-	if err != nil {
-		panic(err)
-	}
-	str := string(data)
-	return str
-}
+func createTestResourceMetrics() pmetric.ResourceMetrics {
+	rm := pmetric.NewResourceMetrics()
+	rm.Resource().Attributes().PutStr(occonventions.AttributeExporterVersion, "SomeVersion")
+	rm.Resource().Attributes().PutStr(conventions.AttributeServiceName, "myServiceName")
+	rm.Resource().Attributes().PutStr(conventions.AttributeServiceNamespace, "myServiceNS")
+	rm.Resource().Attributes().PutStr("ClusterName", "myCluster")
+	rm.Resource().Attributes().PutStr("PodName", "myPod")
+	rm.Resource().Attributes().PutStr(attributeReceiver, prometheusReceiver)
+	sm := rm.ScopeMetrics().AppendEmpty()
 
-func createMetricTestData() *agentmetricspb.ExportMetricsServiceRequest {
-	request := &agentmetricspb.ExportMetricsServiceRequest{
-		Node: &commonpb.Node{
-			LibraryInfo: &commonpb.LibraryInfo{ExporterVersion: "SomeVersion"},
-		},
-		Resource: &resourcepb.Resource{
-			Labels: map[string]string{
-				conventions.AttributeServiceName:      "myServiceName",
-				conventions.AttributeServiceNamespace: "myServiceNS",
-				"ClusterName":                         "myCluster",
-				"PodName":                             "myPod",
-				attributeReceiver:                     prometheusReceiver,
-			},
-		},
-		Metrics: []*metricspb.Metric{
-			{
-				MetricDescriptor: &metricspb.MetricDescriptor{
-					Name:        "spanGaugeCounter",
-					Description: "Counting all the spans",
-					Unit:        "Count",
-					Type:        metricspb.MetricDescriptor_GAUGE_INT64,
-					LabelKeys: []*metricspb.LabelKey{
-						{Key: "spanName"},
-						{Key: "isItAnError"},
-					},
-				},
-				Timeseries: []*metricspb.TimeSeries{
-					{
-						LabelValues: []*metricspb.LabelValue{
-							{Value: "testSpan", HasValue: true},
-							{Value: "false", HasValue: true},
-						},
-						Points: []*metricspb.Point{
-							{
-								Timestamp: &timestamp.Timestamp{
-									Seconds: 100,
-								},
-								Value: &metricspb.Point_Int64Value{
-									Int64Value: 1,
-								},
-							},
-						},
-					},
-				},
-			},
-			{
-				MetricDescriptor: &metricspb.MetricDescriptor{
-					Name:        "spanGaugeDoubleCounter",
-					Description: "Counting all the spans",
-					Unit:        "Count",
-					Type:        metricspb.MetricDescriptor_GAUGE_DOUBLE,
-					LabelKeys: []*metricspb.LabelKey{
-						{Key: "spanName"},
-						{Key: "isItAnError"},
-					},
-				},
-				Timeseries: []*metricspb.TimeSeries{
-					{
-						LabelValues: []*metricspb.LabelValue{
-							{Value: "testSpan", HasValue: true},
-							{Value: "false", HasValue: true},
-						},
-						Points: []*metricspb.Point{
-							{
-								Timestamp: &timestamp.Timestamp{
-									Seconds: 100,
-								},
-								Value: &metricspb.Point_DoubleValue{
-									DoubleValue: 0.1,
-								},
-							},
-						},
-					},
-				},
-			},
-			{
-				MetricDescriptor: &metricspb.MetricDescriptor{
-					Name:        "spanTimer",
-					Description: "How long the spans take",
-					Unit:        "Seconds",
-					Type:        metricspb.MetricDescriptor_CUMULATIVE_DISTRIBUTION,
-					LabelKeys: []*metricspb.LabelKey{
-						{Key: "spanName"},
-					},
-				},
-				Timeseries: []*metricspb.TimeSeries{
-					{
-						LabelValues: []*metricspb.LabelValue{
-							{Value: "testSpan", HasValue: true},
-						},
-						Points: []*metricspb.Point{
-							{
-								Timestamp: &timestamp.Timestamp{
-									Seconds: 100,
-								},
-								Value: &metricspb.Point_DistributionValue{
-									DistributionValue: &metricspb.DistributionValue{
-										Sum:   15.0,
-										Count: 5,
-										BucketOptions: &metricspb.DistributionValue_BucketOptions{
-											Type: &metricspb.DistributionValue_BucketOptions_Explicit_{
-												Explicit: &metricspb.DistributionValue_BucketOptions_Explicit{
-													Bounds: []float64{0, 10},
-												},
-											},
-										},
-										Buckets: []*metricspb.DistributionValue_Bucket{
-											{
-												Count: 0,
-											},
-											{
-												Count: 4,
-											},
-											{
-												Count: 1,
-											},
-										},
-									},
-								},
-							},
-						},
-					},
-				},
-			},
-			{
-				MetricDescriptor: &metricspb.MetricDescriptor{
-					Name:        "spanTimer",
-					Description: "How long the spans take",
-					Unit:        "Seconds",
-					Type:        metricspb.MetricDescriptor_SUMMARY,
-					LabelKeys: []*metricspb.LabelKey{
-						{Key: "spanName"},
-					},
-				},
-				Timeseries: []*metricspb.TimeSeries{
-					{
-						LabelValues: []*metricspb.LabelValue{
-							{Value: "testSpan", HasValue: true},
-						},
-						Points: []*metricspb.Point{
-							{
-								Timestamp: &timestamp.Timestamp{
-									Seconds: 100,
-								},
-								Value: &metricspb.Point_SummaryValue{
-									SummaryValue: &metricspb.SummaryValue{
-										Sum: &wrappers.DoubleValue{
-											Value: 15.0,
-										},
-										Count: &wrappers.Int64Value{
-											Value: 5,
-										},
-										Snapshot: &metricspb.SummaryValue_Snapshot{
-											PercentileValues: []*metricspb.SummaryValue_Snapshot_ValueAtPercentile{{
-												Percentile: 0,
-												Value:      1,
-											},
-												{
-													Percentile: 100,
-													Value:      5,
-												}},
-										},
-									},
-								},
-							},
-						},
-					},
-				},
-			},
-		},
-	}
+	m := sm.Metrics().AppendEmpty()
+	m.SetName("spanGaugeCounter")
+	m.SetDescription("Counting all the spans")
+	m.SetUnit("Count")
+	dp := m.SetEmptyGauge().DataPoints().AppendEmpty()
+	dp.SetTimestamp(pcommon.Timestamp(100_000_000))
+	dp.SetIntValue(1)
+	dp.Attributes().PutStr("spanName", "testSpan")
+	dp.Attributes().PutStr("isItAnError", "false")
+
+	m = sm.Metrics().AppendEmpty()
+	m.SetName("spanGaugeDoubleCounter")
+	m.SetDescription("Counting all the spans")
+	m.SetUnit("Count")
+	dp = m.SetEmptyGauge().DataPoints().AppendEmpty()
+	dp.SetTimestamp(pcommon.Timestamp(100_000_000))
+	dp.SetDoubleValue(0.1)
+	dp.Attributes().PutStr("spanName", "testSpan")
+	dp.Attributes().PutStr("isItAnError", "false")
+
+	m = sm.Metrics().AppendEmpty()
+	m.SetName("spanTimer")
+	m.SetDescription("How long the spans take")
+	m.SetUnit("Seconds")
+	hdp := m.SetEmptyHistogram().DataPoints().AppendEmpty()
+	hdp.SetTimestamp(pcommon.Timestamp(100_000_000))
+	hdp.SetCount(5)
+	hdp.SetSum(15)
+	hdp.ExplicitBounds().FromRaw([]float64{0, 10})
+	hdp.BucketCounts().FromRaw([]uint64{0, 4, 1})
+	hdp.Attributes().PutStr("spanName", "testSpan")
+
+	m = sm.Metrics().AppendEmpty()
+	m.SetName("spanTimer")
+	m.SetDescription("How long the spans take")
+	m.SetUnit("Seconds")
+	sdp := m.SetEmptySummary().DataPoints().AppendEmpty()
+	sdp.SetTimestamp(pcommon.Timestamp(100_000_000))
+	sdp.SetCount(5)
+	sdp.SetSum(15)
+	q1 := sdp.QuantileValues().AppendEmpty()
+	q1.SetQuantile(0)
+	q1.SetValue(1)
+	q2 := sdp.QuantileValues().AppendEmpty()
+	q2.SetQuantile(1)
+	q2.SetValue(5)
 
 	for i := 0; i < 2; i++ {
-		request.Metrics = append(request.Metrics, &metricspb.Metric{
-			MetricDescriptor: &metricspb.MetricDescriptor{
-				Name:        "spanCounter",
-				Description: "Counting all the spans",
-				Unit:        "Count",
-				Type:        metricspb.MetricDescriptor_CUMULATIVE_INT64,
-				LabelKeys: []*metricspb.LabelKey{
-					{Key: "spanName"},
-					{Key: "isItAnError"},
-				},
-			},
-			Timeseries: []*metricspb.TimeSeries{
-				{
-					LabelValues: []*metricspb.LabelValue{
-						{Value: "testSpan", HasValue: true},
-						{Value: "false", HasValue: true},
-					},
-					Points: []*metricspb.Point{
-						{
-							Timestamp: &timestamp.Timestamp{
-								Seconds: int64(i * 100),
-							},
-							Value: &metricspb.Point_Int64Value{
-								Int64Value: int64(i * 1),
-							},
-						},
-					},
-				},
-			},
-		}, &metricspb.Metric{
-			MetricDescriptor: &metricspb.MetricDescriptor{
-				Name:        "spanDoubleCounter",
-				Description: "Counting all the spans",
-				Unit:        "Count",
-				Type:        metricspb.MetricDescriptor_CUMULATIVE_DOUBLE,
-				LabelKeys: []*metricspb.LabelKey{
-					{Key: "spanName"},
-					{Key: "isItAnError"},
-				},
-			},
-			Timeseries: []*metricspb.TimeSeries{
-				{
-					LabelValues: []*metricspb.LabelValue{
-						{Value: "testSpan", HasValue: true},
-						{Value: "false", HasValue: true},
-					},
-					Points: []*metricspb.Point{
-						{
-							Timestamp: &timestamp.Timestamp{
-								Seconds: int64(i * 100),
-							},
-							Value: &metricspb.Point_DoubleValue{
-								DoubleValue: float64(i) * 0.1,
-							},
-						},
-					},
-				},
-			},
-		})
+		m = sm.Metrics().AppendEmpty()
+		m.SetName("spanCounter")
+		m.SetDescription("Counting all the spans")
+		m.SetUnit("Count")
+		sum := m.SetEmptySum()
+		sum.SetAggregationTemporality(pmetric.AggregationTemporalityCumulative)
+		dp = sum.DataPoints().AppendEmpty()
+		dp.SetTimestamp(pcommon.Timestamp(i * 100_000_000))
+		dp.SetIntValue(int64(i))
+		dp.Attributes().PutStr("spanName", "testSpan")
+		dp.Attributes().PutStr("isItAnError", "false")
 
+		m = sm.Metrics().AppendEmpty()
+		m.SetName("spanDoubleCounter")
+		m.SetDescription("Counting all the spans")
+		m.SetUnit("Count")
+		sum = m.SetEmptySum()
+		sum.SetAggregationTemporality(pmetric.AggregationTemporalityCumulative)
+		dp = sum.DataPoints().AppendEmpty()
+		dp.SetTimestamp(pcommon.Timestamp(i * 100_000_000))
+		dp.SetDoubleValue(float64(i) * 0.1)
+		dp.Attributes().PutStr("spanName", "testSpan")
+		dp.Attributes().PutStr("isItAnError", "false")
 	}
-	return request
+
+	return rm
 }
 
 func stringSlicesEqual(expected, actual []string) bool {
@@ -295,25 +120,47 @@ func stringSlicesEqual(expected, actual []string) bool {
 	return true
 }
 
-// hashDimensions hashes dimensions for equality checking.
-func hashDimensions(dims [][]string) []string {
+type dimensionality [][]string
+
+func (d dimensionality) Len() int {
+	return len(d)
+}
+
+func (d dimensionality) Swap(i, j int) {
+	d[i], d[j] = d[j], d[i]
+}
+
+func (d dimensionality) Less(i, j int) bool {
+	dim1 := d[i]
+	dim2 := d[j]
+
+	for k := 0; k < min(len(dim1), len(dim2)); k++ {
+		if dim1[k] != dim2[k] {
+			return dim1[k] < dim2[k]
+		}
+	}
+
+	return len(dim1) < len(dim2)
+}
+
+// normalizes a dimensionality lexicographically so that it can be compared
+func normalizeDimensionality(dims [][]string) [][]string {
 	// Convert to string for easier sorting
-	stringified := make([]string, len(dims))
+	sortedDimensions := make([][]string, len(dims))
 	for i, v := range dims {
 		sort.Strings(v)
-		stringified[i] = strings.Join(v, ",")
+		sortedDimensions[i] = v
 	}
-	// Sort across dimension sets for equality checking
-	sort.Strings(stringified)
-	return stringified
+	sort.Sort(dimensionality(sortedDimensions))
+	return sortedDimensions
 }
 
 // hashMetricSlice hashes a metrics slice for equality checking.
-func hashMetricSlice(metricSlice []map[string]string) []string {
+func hashMetricSlice(metricSlice []cWMetricInfo) []string {
 	// Convert to string for easier sorting
 	stringified := make([]string, len(metricSlice))
 	for i, v := range metricSlice {
-		stringified[i] = v["Name"] + "," + v["Unit"]
+		stringified[i] = fmt.Sprint(v.Name) + "," + fmt.Sprint(v.Unit) + "," + fmt.Sprint(v.StorageResolution)
 	}
 	// Sort across metrics for equality checking
 	sort.Strings(stringified)
@@ -324,9 +171,9 @@ func hashMetricSlice(metricSlice []map[string]string) []string {
 // (i.e. has same sets of dimensions), regardless of order.
 func assertDimsEqual(t *testing.T, expected, actual [][]string) {
 	assert.Equal(t, len(expected), len(actual))
-	expectedHashedDimensions := hashDimensions(expected)
-	actualHashedDimensions := hashDimensions(actual)
-	assert.Equal(t, expectedHashedDimensions, actualHashedDimensions)
+	expectedDimensions := normalizeDimensionality(expected)
+	actualDimensions := normalizeDimensionality(actual)
+	assert.Equal(t, expectedDimensions, actualDimensions)
 }
 
 // cWMeasurementEqual returns true if CW Measurements are equal.
@@ -350,9 +197,9 @@ func cWMeasurementEqual(expected, actual cWMeasurement) bool {
 	if len(expected.Dimensions) != len(actual.Dimensions) {
 		return false
 	}
-	expectedHashedDimensions := hashDimensions(expected.Dimensions)
-	actualHashedDimensions := hashDimensions(actual.Dimensions)
-	return stringSlicesEqual(expectedHashedDimensions, actualHashedDimensions)
+	expectedDimensions := normalizeDimensionality(expected.Dimensions)
+	actualDimensions := normalizeDimensionality(actual.Dimensions)
+	return reflect.DeepEqual(expectedDimensions, actualDimensions)
 }
 
 // assertCWMeasurementEqual asserts whether CW Measurements are equal.
@@ -402,20 +249,19 @@ func TestTranslateOtToGroupedMetric(t *testing.T) {
 		DimensionRollupOption: zeroAndSingleDimensionRollup,
 		logger:                zap.NewNop(),
 	}
-	oc := createMetricTestData()
-
 	translator := newMetricTranslator(*config)
+	defer require.NoError(t, translator.Shutdown())
 
-	noInstrLibMetric := internaldata.OCToMetrics(oc.Node, oc.Resource, oc.Metrics).ResourceMetrics().At(0)
-	instrLibMetric := internaldata.OCToMetrics(oc.Node, oc.Resource, oc.Metrics).ResourceMetrics().At(0)
-	ilm := instrLibMetric.InstrumentationLibraryMetrics().At(0)
-	ilm.InstrumentationLibrary().SetName("cloudwatch-lib")
+	noInstrLibMetric := createTestResourceMetrics()
+	instrLibMetric := createTestResourceMetrics()
+	ilm := instrLibMetric.ScopeMetrics().At(0)
+	ilm.Scope().SetName("cloudwatch-lib")
 
-	noNamespaceMetric := internaldata.OCToMetrics(oc.Node, oc.Resource, oc.Metrics).ResourceMetrics().At(0)
-	noNamespaceMetric.Resource().Attributes().Delete(conventions.AttributeServiceNamespace)
-	noNamespaceMetric.Resource().Attributes().Delete(conventions.AttributeServiceName)
+	noNamespaceMetric := createTestResourceMetrics()
+	noNamespaceMetric.Resource().Attributes().Remove(conventions.AttributeServiceNamespace)
+	noNamespaceMetric.Resource().Attributes().Remove(conventions.AttributeServiceName)
 
-	counterMetrics := map[string]*metricInfo{
+	counterSumMetrics := map[string]*metricInfo{
 		"spanCounter": {
 			value: float64(1),
 			unit:  "Count",
@@ -424,6 +270,8 @@ func TestTranslateOtToGroupedMetric(t *testing.T) {
 			value: 0.1,
 			unit:  "Count",
 		},
+	}
+	counterGaugeMetrics := map[string]*metricInfo{
 		"spanGaugeCounter": {
 			value: float64(1),
 			unit:  "Count",
@@ -445,14 +293,14 @@ func TestTranslateOtToGroupedMetric(t *testing.T) {
 
 	testCases := []struct {
 		testName          string
-		metric            *pdata.ResourceMetrics
+		metric            pmetric.ResourceMetrics
 		counterLabels     map[string]string
 		timerLabels       map[string]string
 		expectedNamespace string
 	}{
 		{
 			"w/ instrumentation library and namespace",
-			&instrLibMetric,
+			instrLibMetric,
 			map[string]string{
 				(oTellibDimensionKey): "cloudwatch-lib",
 				"isItAnError":         "false",
@@ -466,7 +314,7 @@ func TestTranslateOtToGroupedMetric(t *testing.T) {
 		},
 		{
 			"w/o instrumentation library, w/ namespace",
-			&noInstrLibMetric,
+			noInstrLibMetric,
 			map[string]string{
 				"isItAnError": "false",
 				"spanName":    "testSpan",
@@ -478,7 +326,7 @@ func TestTranslateOtToGroupedMetric(t *testing.T) {
 		},
 		{
 			"w/o instrumentation library and namespace",
-			&noNamespaceMetric,
+			noNamespaceMetric,
 			map[string]string{
 				"isItAnError": "false",
 				"spanName":    "testSpan",
@@ -492,78 +340,118 @@ func TestTranslateOtToGroupedMetric(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.testName, func(t *testing.T) {
-			setupDataPointCache()
-
-			groupedMetrics := make(map[interface{}]*groupedMetric)
-			translator.translateOTelToGroupedMetric(tc.metric, groupedMetrics, config)
+			groupedMetrics := make(map[any]*groupedMetric)
+			err := translator.translateOTelToGroupedMetric(tc.metric, groupedMetrics, config)
+			assert.NoError(t, err)
 			assert.NotNil(t, groupedMetrics)
-			assert.Equal(t, 2, len(groupedMetrics))
+			assert.Len(t, groupedMetrics, 3)
 
 			for _, v := range groupedMetrics {
 				assert.Equal(t, tc.expectedNamespace, v.metadata.namespace)
-				if len(v.metrics) == 4 {
+				switch {
+				case v.metadata.metricDataType == pmetric.MetricTypeSum:
+					assert.Len(t, v.metrics, 2)
 					assert.Equal(t, tc.counterLabels, v.labels)
-					assert.Equal(t, counterMetrics, v.metrics)
-				} else {
-					assert.Equal(t, 1, len(v.metrics))
+					assert.Equal(t, counterSumMetrics, v.metrics)
+				case v.metadata.metricDataType == pmetric.MetricTypeGauge:
+					assert.Len(t, v.metrics, 2)
+					assert.Equal(t, tc.counterLabels, v.labels)
+					assert.Equal(t, counterGaugeMetrics, v.metrics)
+				case v.metadata.metricDataType == pmetric.MetricTypeHistogram:
+					assert.Len(t, v.metrics, 1)
 					assert.Equal(t, tc.timerLabels, v.labels)
 					assert.Equal(t, timerMetrics, v.metrics)
+				default:
+					assert.Fail(t, fmt.Sprintf("Unhandled metric type %s not expected", v.metadata.metricDataType))
 				}
 			}
 		})
 	}
 
 	t.Run("No metrics", func(t *testing.T) {
-		oc = &agentmetricspb.ExportMetricsServiceRequest{
-			Node: &commonpb.Node{
-				LibraryInfo: &commonpb.LibraryInfo{ExporterVersion: "SomeVersion"},
-			},
-			Resource: &resourcepb.Resource{
-				Labels: map[string]string{
-					conventions.AttributeServiceName: "myServiceName",
-				},
-			},
-			Metrics: []*metricspb.Metric{},
-		}
-		rm := internaldata.OCToMetrics(oc.Node, oc.Resource, oc.Metrics).ResourceMetrics().At(0)
-		groupedMetrics := make(map[interface{}]*groupedMetric)
-		translator.translateOTelToGroupedMetric(&rm, groupedMetrics, config)
-		assert.Equal(t, 0, len(groupedMetrics))
+		rm := pmetric.NewResourceMetrics()
+		rm.Resource().Attributes().PutStr(conventions.AttributeServiceName, "myServiceName")
+		rm.Resource().Attributes().PutStr(occonventions.AttributeExporterVersion, "SomeVersion")
+		groupedMetrics := make(map[any]*groupedMetric)
+		err := translator.translateOTelToGroupedMetric(rm, groupedMetrics, config)
+		assert.NoError(t, err)
+		assert.Empty(t, groupedMetrics)
 	})
 }
 
 func TestTranslateCWMetricToEMF(t *testing.T) {
-	cwMeasurement := cWMeasurement{
-		Namespace:  "test-emf",
-		Dimensions: [][]string{{oTellibDimensionKey}, {oTellibDimensionKey, "spanName"}},
-		Metrics: []map[string]string{{
-			"Name": "spanCounter",
-			"Unit": "Count",
-		}},
+	testCases := map[string]struct {
+		emfVersion          string
+		measurements        []cWMeasurement
+		expectedEMFLogEvent string
+	}{
+		"WithMeasurementAndEMFV1": {
+			emfVersion: "1",
+			measurements: []cWMeasurement{{
+				Namespace:  "test-emf",
+				Dimensions: [][]string{{oTellibDimensionKey}, {oTellibDimensionKey, "spanName"}},
+				Metrics: []cWMetricInfo{{
+					Name:              "spanCounter",
+					Unit:              "Count",
+					StorageResolution: 1,
+				}},
+			}},
+			expectedEMFLogEvent: "{\"OTelLib\":\"cloudwatch-otel\",\"Sources\":[\"cadvisor\",\"pod\",\"calculated\"],\"Version\":\"1\",\"_aws\":{\"CloudWatchMetrics\":[{\"Namespace\":\"test-emf\",\"Dimensions\":[[\"OTelLib\"],[\"OTelLib\",\"spanName\"]],\"Metrics\":[{\"Name\":\"spanCounter\",\"Unit\":\"Count\",\"StorageResolution\":1}]}],\"Timestamp\":1596151098037},\"kubernetes\":{\"container_name\":\"cloudwatch-agent\",\"docker\":{\"container_id\":\"fc1b0a4c3faaa1808e187486a3a90cbea883dccaf2e2c46d4069d663b032a1ca\"},\"host\":\"ip-192-168-58-245.ec2.internal\",\"labels\":{\"controller-revision-hash\":\"5bdbf497dc\",\"name\":\"cloudwatch-agent\",\"pod-template-generation\":\"1\"},\"namespace_name\":\"amazon-cloudwatch\",\"pod_id\":\"e23f3413-af2e-4a98-89e0-5df2251e7f05\",\"pod_name\":\"cloudwatch-agent-26bl6\",\"pod_owners\":[{\"owner_kind\":\"DaemonSet\",\"owner_name\":\"cloudwatch-agent\"}]},\"spanCounter\":0,\"spanName\":\"test\"}",
+		},
+		"WithMeasurementAndEMFV0": {
+			emfVersion: "0",
+			measurements: []cWMeasurement{{
+				Namespace:  "test-emf",
+				Dimensions: [][]string{{oTellibDimensionKey}, {oTellibDimensionKey, "spanName"}},
+				Metrics: []cWMetricInfo{{
+					Name:              "spanCounter",
+					Unit:              "Count",
+					StorageResolution: 60,
+				}},
+			}},
+			expectedEMFLogEvent: "{\"CloudWatchMetrics\":[{\"Namespace\":\"test-emf\",\"Dimensions\":[[\"OTelLib\"],[\"OTelLib\",\"spanName\"]],\"Metrics\":[{\"Name\":\"spanCounter\",\"Unit\":\"Count\",\"StorageResolution\":60}]}],\"OTelLib\":\"cloudwatch-otel\",\"Sources\":[\"cadvisor\",\"pod\",\"calculated\"],\"Timestamp\":\"1596151098037\",\"Version\":\"0\",\"kubernetes\":{\"container_name\":\"cloudwatch-agent\",\"docker\":{\"container_id\":\"fc1b0a4c3faaa1808e187486a3a90cbea883dccaf2e2c46d4069d663b032a1ca\"},\"host\":\"ip-192-168-58-245.ec2.internal\",\"labels\":{\"controller-revision-hash\":\"5bdbf497dc\",\"name\":\"cloudwatch-agent\",\"pod-template-generation\":\"1\"},\"namespace_name\":\"amazon-cloudwatch\",\"pod_id\":\"e23f3413-af2e-4a98-89e0-5df2251e7f05\",\"pod_name\":\"cloudwatch-agent-26bl6\",\"pod_owners\":[{\"owner_kind\":\"DaemonSet\",\"owner_name\":\"cloudwatch-agent\"}]},\"spanCounter\":0,\"spanName\":\"test\"}",
+		},
+		"WithNoMeasurementAndEMFV1": {
+			emfVersion:          "1",
+			measurements:        nil,
+			expectedEMFLogEvent: "{\"OTelLib\":\"cloudwatch-otel\",\"Sources\":[\"cadvisor\",\"pod\",\"calculated\"],\"kubernetes\":{\"container_name\":\"cloudwatch-agent\",\"docker\":{\"container_id\":\"fc1b0a4c3faaa1808e187486a3a90cbea883dccaf2e2c46d4069d663b032a1ca\"},\"host\":\"ip-192-168-58-245.ec2.internal\",\"labels\":{\"controller-revision-hash\":\"5bdbf497dc\",\"name\":\"cloudwatch-agent\",\"pod-template-generation\":\"1\"},\"namespace_name\":\"amazon-cloudwatch\",\"pod_id\":\"e23f3413-af2e-4a98-89e0-5df2251e7f05\",\"pod_name\":\"cloudwatch-agent-26bl6\",\"pod_owners\":[{\"owner_kind\":\"DaemonSet\",\"owner_name\":\"cloudwatch-agent\"}]},\"spanCounter\":0,\"spanName\":\"test\"}",
+		},
+		"WithNoMeasurementAndEMFV0": {
+			emfVersion:          "0",
+			measurements:        nil,
+			expectedEMFLogEvent: "{\"OTelLib\":\"cloudwatch-otel\",\"Sources\":[\"cadvisor\",\"pod\",\"calculated\"],\"Timestamp\":\"1596151098037\",\"kubernetes\":{\"container_name\":\"cloudwatch-agent\",\"docker\":{\"container_id\":\"fc1b0a4c3faaa1808e187486a3a90cbea883dccaf2e2c46d4069d663b032a1ca\"},\"host\":\"ip-192-168-58-245.ec2.internal\",\"labels\":{\"controller-revision-hash\":\"5bdbf497dc\",\"name\":\"cloudwatch-agent\",\"pod-template-generation\":\"1\"},\"namespace_name\":\"amazon-cloudwatch\",\"pod_id\":\"e23f3413-af2e-4a98-89e0-5df2251e7f05\",\"pod_name\":\"cloudwatch-agent-26bl6\",\"pod_owners\":[{\"owner_kind\":\"DaemonSet\",\"owner_name\":\"cloudwatch-agent\"}]},\"spanCounter\":0,\"spanName\":\"test\"}",
+		},
 	}
-	timestamp := int64(1596151098037)
-	fields := make(map[string]interface{})
-	fields[oTellibDimensionKey] = "cloudwatch-otel"
-	fields["spanName"] = "test"
-	fields["spanCounter"] = 0
-	//add stringified json as attribute values
-	fields["kubernetes"] = "{\"container_name\":\"cloudwatch-agent\",\"docker\":{\"container_id\":\"fc1b0a4c3faaa1808e187486a3a90cbea883dccaf2e2c46d4069d663b032a1ca\"},\"host\":\"ip-192-168-58-245.ec2.internal\",\"labels\":{\"controller-revision-hash\":\"5bdbf497dc\",\"name\":\"cloudwatch-agent\",\"pod-template-generation\":\"1\"},\"namespace_name\":\"amazon-cloudwatch\",\"pod_id\":\"e23f3413-af2e-4a98-89e0-5df2251e7f05\",\"pod_name\":\"cloudwatch-agent-26bl6\",\"pod_owners\":[{\"owner_kind\":\"DaemonSet\",\"owner_name\":\"cloudwatch-agent\"}]}"
-	fields["Sources"] = "[\"cadvisor\",\"pod\",\"calculated\"]"
 
-	config := &Config{
-		//include valid json string, a non-existing key, and keys whose value are not json/string
-		ParseJSONEncodedAttributeValues: []string{"kubernetes", "Sources", "NonExistingAttributeKey", "spanName", "spanCounter"},
-		logger:                          zap.NewNop(),
+	for name, tc := range testCases {
+		t.Run(name, func(_ *testing.T) {
+			config := &Config{
+				// include valid json string, a non-existing key, and keys whose value are not json/string
+				ParseJSONEncodedAttributeValues: []string{"kubernetes", "Sources", "NonExistingAttributeKey", "spanName", "spanCounter"},
+				Version:                         tc.emfVersion,
+				logger:                          zap.NewNop(),
+			}
+
+			fields := map[string]any{
+				oTellibDimensionKey: "cloudwatch-otel",
+				"spanName":          "test",
+				"spanCounter":       0,
+				"kubernetes":        "{\"container_name\":\"cloudwatch-agent\",\"docker\":{\"container_id\":\"fc1b0a4c3faaa1808e187486a3a90cbea883dccaf2e2c46d4069d663b032a1ca\"},\"host\":\"ip-192-168-58-245.ec2.internal\",\"labels\":{\"controller-revision-hash\":\"5bdbf497dc\",\"name\":\"cloudwatch-agent\",\"pod-template-generation\":\"1\"},\"namespace_name\":\"amazon-cloudwatch\",\"pod_id\":\"e23f3413-af2e-4a98-89e0-5df2251e7f05\",\"pod_name\":\"cloudwatch-agent-26bl6\",\"pod_owners\":[{\"owner_kind\":\"DaemonSet\",\"owner_name\":\"cloudwatch-agent\"}]}",
+				"Sources":           "[\"cadvisor\",\"pod\",\"calculated\"]",
+			}
+
+			cloudwatchMetric := &cWMetrics{
+				timestampMs:  int64(1596151098037),
+				fields:       fields,
+				measurements: tc.measurements,
+			}
+
+			emfLogEvent, err := translateCWMetricToEMF(cloudwatchMetric, config)
+			require.NoError(t, err)
+
+			assert.Equal(t, tc.expectedEMFLogEvent, *emfLogEvent.InputLogEvent.Message)
+		})
 	}
-
-	met := &cWMetrics{
-		timestampMs:  timestamp,
-		fields:       fields,
-		measurements: []cWMeasurement{cwMeasurement},
-	}
-	inputLogEvent := translateCWMetricToEMF(met, config)
-
-	assert.Equal(t, readFromFile("testdata/testTranslateCWMetricToEMF.json"), *inputLogEvent.InputLogEvent.Message, "Expect to be equal")
 }
 
 func TestTranslateGroupedMetricToCWMetric(t *testing.T) {
@@ -600,16 +488,17 @@ func TestTranslateGroupedMetricToCWMetric(t *testing.T) {
 					{
 						Namespace:  namespace,
 						Dimensions: [][]string{{"label1"}},
-						Metrics: []map[string]string{
+						Metrics: []cWMetricInfo{
 							{
-								"Name": "metric1",
-								"Unit": "Count",
+								Name:              "metric1",
+								Unit:              "Count",
+								StorageResolution: 60,
 							},
 						},
 					},
 				},
 				timestampMs: timestamp,
-				fields: map[string]interface{}{
+				fields: map[string]any{
 					"label1":  "value1",
 					"metric1": 1,
 				},
@@ -645,16 +534,17 @@ func TestTranslateGroupedMetricToCWMetric(t *testing.T) {
 					{
 						Namespace:  namespace,
 						Dimensions: [][]string{{"label1"}},
-						Metrics: []map[string]string{
+						Metrics: []cWMetricInfo{
 							{
-								"Name": "metric1",
-								"Unit": "Count",
+								Name:              "metric1",
+								Unit:              "Count",
+								StorageResolution: 60,
 							},
 						},
 					},
 				},
 				timestampMs: timestamp,
-				fields: map[string]interface{}{
+				fields: map[string]any{
 					"label1":  "value1",
 					"metric1": 1,
 				},
@@ -694,24 +584,27 @@ func TestTranslateGroupedMetricToCWMetric(t *testing.T) {
 					{
 						Namespace:  namespace,
 						Dimensions: [][]string{{"label1", "label2"}},
-						Metrics: []map[string]string{
+						Metrics: []cWMetricInfo{
 							{
-								"Name": "metric1",
-								"Unit": "Count",
+								Name:              "metric1",
+								Unit:              "Count",
+								StorageResolution: 60,
 							},
 							{
-								"Name": "metric2",
-								"Unit": "Count",
+								Name:              "metric2",
+								Unit:              "Count",
+								StorageResolution: 60,
 							},
 							{
-								"Name": "metric3",
-								"Unit": "Seconds",
+								Name:              "metric3",
+								Unit:              "Seconds",
+								StorageResolution: 60,
 							},
 						},
 					},
 				},
 				timestampMs: timestamp,
-				fields: map[string]interface{}{
+				fields: map[string]any{
 					"label1":  "value1",
 					"label2":  "value2",
 					"metric1": 1,
@@ -769,26 +662,28 @@ func TestTranslateGroupedMetricToCWMetric(t *testing.T) {
 					{
 						Namespace:  namespace,
 						Dimensions: [][]string{{"label1"}},
-						Metrics: []map[string]string{
+						Metrics: []cWMetricInfo{
 							{
-								"Name": "metric1",
-								"Unit": "Count",
+								Name:              "metric1",
+								Unit:              "Count",
+								StorageResolution: 60,
 							},
 						},
 					},
 					{
 						Namespace:  namespace,
 						Dimensions: [][]string{{"label1", "label2"}},
-						Metrics: []map[string]string{
+						Metrics: []cWMetricInfo{
 							{
-								"Name": "metric2",
-								"Unit": "Count",
+								Name:              "metric2",
+								Unit:              "Count",
+								StorageResolution: 60,
 							},
 						},
 					},
 				},
 				timestampMs: timestamp,
-				fields: map[string]interface{}{
+				fields: map[string]any{
 					"label1":  "value1",
 					"label2":  "value2",
 					"metric1": 1,
@@ -821,7 +716,7 @@ func TestTranslateGroupedMetricToCWMetric(t *testing.T) {
 					},
 				},
 				timestampMs: timestamp,
-				fields: map[string]interface{}{
+				fields: map[string]any{
 					"label1": "value1",
 				},
 			},
@@ -840,11 +735,11 @@ func TestTranslateGroupedMetricToCWMetric(t *testing.T) {
 				},
 				metadata: cWMetricMetadata{
 					groupedMetricMetadata: groupedMetricMetadata{
-						namespace:   namespace,
-						timestampMs: timestamp,
+						namespace:      namespace,
+						timestampMs:    timestamp,
+						metricDataType: pmetric.MetricTypeGauge,
 					},
-					receiver:       prometheusReceiver,
-					metricDataType: pdata.MetricDataTypeGauge,
+					receiver: prometheusReceiver,
 				},
 			},
 			nil,
@@ -853,16 +748,17 @@ func TestTranslateGroupedMetricToCWMetric(t *testing.T) {
 					{
 						Namespace:  namespace,
 						Dimensions: [][]string{{"label1"}},
-						Metrics: []map[string]string{
+						Metrics: []cWMetricInfo{
 							{
-								"Name": "metric1",
-								"Unit": "Count",
+								Name:              "metric1",
+								Unit:              "Count",
+								StorageResolution: 60,
 							},
 						},
 					},
 				},
 				timestampMs: timestamp,
-				fields: map[string]interface{}{
+				fields: map[string]any{
 					"label1":                  "value1",
 					"metric1":                 1,
 					fieldPrometheusMetricType: "gauge",
@@ -881,7 +777,8 @@ func TestTranslateGroupedMetricToCWMetric(t *testing.T) {
 				logger:                logger,
 			}
 			for _, decl := range tc.metricDeclarations {
-				decl.init(logger)
+				err := decl.init(logger)
+				assert.NoError(t, err)
 			}
 			cWMetric := translateGroupedMetricToCWMetric(tc.groupedMetric, config)
 			assert.NotNil(t, cWMetric)
@@ -922,10 +819,11 @@ func TestGroupedMetricToCWMeasurement(t *testing.T) {
 			cWMeasurement{
 				Namespace:  namespace,
 				Dimensions: [][]string{{"label1"}},
-				Metrics: []map[string]string{
+				Metrics: []cWMetricInfo{
 					{
-						"Name": "metric1",
-						"Unit": "Count",
+						Name:              "metric1",
+						Unit:              "Count",
+						StorageResolution: 60,
 					},
 				},
 			},
@@ -962,18 +860,21 @@ func TestGroupedMetricToCWMeasurement(t *testing.T) {
 			cWMeasurement{
 				Namespace:  namespace,
 				Dimensions: [][]string{{"label1", "label2"}},
-				Metrics: []map[string]string{
+				Metrics: []cWMetricInfo{
 					{
-						"Name": "metric1",
-						"Unit": "Count",
+						Name:              "metric1",
+						Unit:              "Count",
+						StorageResolution: 60,
 					},
 					{
-						"Name": "metric2",
-						"Unit": "Count",
+						Name:              "metric2",
+						Unit:              "Count",
+						StorageResolution: 60,
 					},
 					{
-						"Name": "metric3",
-						"Unit": "Seconds",
+						Name:              "metric3",
+						Unit:              "Seconds",
+						StorageResolution: 60,
 					},
 				},
 			},
@@ -1001,10 +902,11 @@ func TestGroupedMetricToCWMeasurement(t *testing.T) {
 			cWMeasurement{
 				Namespace:  namespace,
 				Dimensions: [][]string{{"label1"}},
-				Metrics: []map[string]string{
+				Metrics: []cWMetricInfo{
 					{
-						"Name": "metric1",
-						"Unit": "Count",
+						Name:              "metric1",
+						Unit:              "Count",
+						StorageResolution: 60,
 					},
 				},
 			},
@@ -1046,18 +948,21 @@ func TestGroupedMetricToCWMeasurement(t *testing.T) {
 					{"label2"},
 					{},
 				},
-				Metrics: []map[string]string{
+				Metrics: []cWMetricInfo{
 					{
-						"Name": "metric1",
-						"Unit": "Count",
+						Name:              "metric1",
+						Unit:              "Count",
+						StorageResolution: 60,
 					},
 					{
-						"Name": "metric2",
-						"Unit": "Count",
+						Name:              "metric2",
+						Unit:              "Count",
+						StorageResolution: 60,
 					},
 					{
-						"Name": "metric3",
-						"Unit": "Seconds",
+						Name:              "metric3",
+						Unit:              "Seconds",
+						StorageResolution: 60,
 					},
 				},
 			},
@@ -1289,18 +1194,21 @@ func TestGroupedMetricToCWMeasurementsWithFilters(t *testing.T) {
 				{
 					Namespace:  namespace,
 					Dimensions: [][]string{{"a"}, {"a", "c"}},
-					Metrics: []map[string]string{
+					Metrics: []cWMetricInfo{
 						{
-							"Name": "metric1",
-							"Unit": "Count",
+							Name:              "metric1",
+							Unit:              "Count",
+							StorageResolution: 60,
 						},
 						{
-							"Name": "metric2",
-							"Unit": "Count",
+							Name:              "metric2",
+							Unit:              "Count",
+							StorageResolution: 60,
 						},
 						{
-							"Name": "metric3",
-							"Unit": "Seconds",
+							Name:              "metric3",
+							Unit:              "Seconds",
+							StorageResolution: 60,
 						},
 					},
 				},
@@ -1326,30 +1234,33 @@ func TestGroupedMetricToCWMeasurementsWithFilters(t *testing.T) {
 				{
 					Namespace:  namespace,
 					Dimensions: [][]string{{"a"}, {"b"}, {"a", "c"}},
-					Metrics: []map[string]string{
+					Metrics: []cWMetricInfo{
 						{
-							"Name": "metric1",
-							"Unit": "Count",
+							Name:              "metric1",
+							Unit:              "Count",
+							StorageResolution: 60,
 						},
 					},
 				},
 				{
 					Namespace:  namespace,
 					Dimensions: [][]string{{"a"}, {"b"}},
-					Metrics: []map[string]string{
+					Metrics: []cWMetricInfo{
 						{
-							"Name": "metric2",
-							"Unit": "Count",
+							Name:              "metric2",
+							Unit:              "Count",
+							StorageResolution: 60,
 						},
 					},
 				},
 				{
 					Namespace:  namespace,
 					Dimensions: [][]string{{"a"}},
-					Metrics: []map[string]string{
+					Metrics: []cWMetricInfo{
 						{
-							"Name": "metric3",
-							"Unit": "Seconds",
+							Name:              "metric3",
+							Unit:              "Seconds",
+							StorageResolution: 60,
 						},
 					},
 				},
@@ -1371,24 +1282,27 @@ func TestGroupedMetricToCWMeasurementsWithFilters(t *testing.T) {
 				{
 					Namespace:  namespace,
 					Dimensions: [][]string{{"a"}, {"b"}},
-					Metrics: []map[string]string{
+					Metrics: []cWMetricInfo{
 						{
-							"Name": "metric1",
-							"Unit": "Count",
+							Name:              "metric1",
+							Unit:              "Count",
+							StorageResolution: 60,
 						},
 						{
-							"Name": "metric2",
-							"Unit": "Count",
+							Name:              "metric2",
+							Unit:              "Count",
+							StorageResolution: 60,
 						},
 					},
 				},
 				{
 					Namespace:  namespace,
 					Dimensions: [][]string{{"a"}},
-					Metrics: []map[string]string{
+					Metrics: []cWMetricInfo{
 						{
-							"Name": "metric3",
-							"Unit": "Seconds",
+							Name:              "metric3",
+							Unit:              "Seconds",
+							StorageResolution: 60,
 						},
 					},
 				},
@@ -1410,14 +1324,16 @@ func TestGroupedMetricToCWMeasurementsWithFilters(t *testing.T) {
 				{
 					Namespace:  namespace,
 					Dimensions: [][]string{{"a"}, {"b"}},
-					Metrics: []map[string]string{
+					Metrics: []cWMetricInfo{
 						{
-							"Name": "metric1",
-							"Unit": "Count",
+							Name:              "metric1",
+							Unit:              "Count",
+							StorageResolution: 60,
 						},
 						{
-							"Name": "metric2",
-							"Unit": "Count",
+							Name:              "metric2",
+							Unit:              "Count",
+							StorageResolution: 60,
 						},
 					},
 				},
@@ -1432,6 +1348,33 @@ func TestGroupedMetricToCWMeasurementsWithFilters(t *testing.T) {
 				},
 			},
 			nil,
+		},
+		{
+			"empty dimension set matches",
+			[]*MetricDeclaration{
+				{
+					Dimensions:          [][]string{{}},
+					MetricNameSelectors: []string{"metric(1|3)"},
+				},
+			},
+			[]cWMeasurement{
+				{
+					Namespace:  namespace,
+					Dimensions: [][]string{{}},
+					Metrics: []cWMetricInfo{
+						{
+							Name:              "metric1",
+							Unit:              "Count",
+							StorageResolution: 60,
+						},
+						{
+							Name:              "metric3",
+							Unit:              "Seconds",
+							StorageResolution: 60,
+						},
+					},
+				},
+			},
 		},
 		{
 			"label matchers",
@@ -1461,18 +1404,21 @@ func TestGroupedMetricToCWMeasurementsWithFilters(t *testing.T) {
 				{
 					Namespace:  namespace,
 					Dimensions: [][]string{{"b"}},
-					Metrics: []map[string]string{
+					Metrics: []cWMetricInfo{
 						{
-							"Name": "metric1",
-							"Unit": "Count",
+							Name:              "metric1",
+							Unit:              "Count",
+							StorageResolution: 60,
 						},
 						{
-							"Name": "metric2",
-							"Unit": "Count",
+							Name:              "metric2",
+							Unit:              "Count",
+							StorageResolution: 60,
 						},
 						{
-							"Name": "metric3",
-							"Unit": "Seconds",
+							Name:              "metric3",
+							Unit:              "Seconds",
+							StorageResolution: 60,
 						},
 					},
 				},
@@ -1501,7 +1447,7 @@ func TestGroupedMetricToCWMeasurementsWithFilters(t *testing.T) {
 			}
 			for _, decl := range tc.metricDeclarations {
 				err := decl.init(logger)
-				assert.Nil(t, err)
+				assert.NoError(t, err)
 			}
 
 			cWMeasurements := groupedMetricToCWMeasurementsWithFilters(groupedMetric, config)
@@ -1546,7 +1492,7 @@ func TestGroupedMetricToCWMeasurementsWithFilters(t *testing.T) {
 		}
 		for _, decl := range metricDeclarations {
 			err := decl.init(zap.NewNop())
-			assert.Nil(t, err)
+			assert.NoError(t, err)
 		}
 		obs, logs := observer.New(zap.DebugLevel)
 		logger := zap.New(obs)
@@ -1572,7 +1518,7 @@ func TestGroupedMetricToCWMeasurementsWithFilters(t *testing.T) {
 		// Have to perform this hacky equality check because the metric names might not
 		// be in the right order due to map iteration
 		assert.Equal(t, expectedLog.Entry, log.Entry)
-		assert.Equal(t, 2, len(log.Context))
+		assert.Len(t, log.Context, 2)
 		assert.Equal(t, expectedLog.Context[0], log.Context[0])
 		isMatch := false
 		possibleOrders := []zapcore.Field{
@@ -1611,7 +1557,7 @@ func TestGroupedMetricToCWMeasurementsWithFilters(t *testing.T) {
 		}
 		for _, decl := range metricDeclarations {
 			err := decl.init(zap.NewNop())
-			assert.Nil(t, err)
+			assert.NoError(t, err)
 		}
 		obs, logs := observer.New(zap.DebugLevel)
 		logger := zap.New(obs)
@@ -1636,7 +1582,7 @@ func TestGroupedMetricToCWMeasurementsWithFilters(t *testing.T) {
 		seen := make([]bool, 3)
 		for _, log := range logs.AllUntimed() {
 			assert.Equal(t, expectedEntry, log.Entry)
-			assert.Equal(t, 1, len(log.Context))
+			assert.Len(t, log.Context, 1)
 			hasMatch := false
 			for i, expectedCtx := range expectedContexts {
 				if !seen[i] && log.Context[0].Equals(expectedCtx) {
@@ -1993,6 +1939,18 @@ func TestGroupedMetricToCWMeasurementsWithFilters(t *testing.T) {
 			zeroAndSingleDimensionRollup,
 			nil,
 		},
+		{
+			"no labels with empty dimension",
+			map[string]string{},
+			[]*MetricDeclaration{
+				{
+					Dimensions:          [][]string{{}, {"a"}},
+					MetricNameSelectors: []string{metricName},
+				},
+			},
+			zeroAndSingleDimensionRollup,
+			[][]string{{}},
+		},
 	}
 
 	for _, tc := range rollupTestCases {
@@ -2014,7 +1972,7 @@ func TestGroupedMetricToCWMeasurementsWithFilters(t *testing.T) {
 			}
 			for _, decl := range tc.metricDeclarations {
 				err := decl.init(zap.NewNop())
-				assert.Nil(t, err)
+				assert.NoError(t, err)
 			}
 			config := &Config{
 				DimensionRollupOption: tc.dimensionRollupOption,
@@ -2024,9 +1982,9 @@ func TestGroupedMetricToCWMeasurementsWithFilters(t *testing.T) {
 
 			cWMeasurements := groupedMetricToCWMeasurementsWithFilters(groupedMetric, config)
 			if len(tc.expectedDims) == 0 {
-				assert.Equal(t, 0, len(cWMeasurements))
+				assert.Empty(t, cWMeasurements)
 			} else {
-				assert.Equal(t, 1, len(cWMeasurements))
+				assert.Len(t, cWMeasurements, 1)
 				dims := cWMeasurements[0].Dimensions
 				assertDimsEqual(t, tc.expectedDims, dims)
 			}
@@ -2034,50 +1992,32 @@ func TestGroupedMetricToCWMeasurementsWithFilters(t *testing.T) {
 	}
 }
 
-func TestTranslateCWMetricToEMFNoMeasurements(t *testing.T) {
-	timestamp := int64(1596151098037)
-	fields := make(map[string]interface{})
-	fields[oTellibDimensionKey] = "cloudwatch-otel"
-	fields["spanName"] = "test"
-	fields["spanCounter"] = 0
-
-	met := &cWMetrics{
-		timestampMs:  timestamp,
-		fields:       fields,
-		measurements: nil,
-	}
-	inputLogEvent := translateCWMetricToEMF(met, &Config{})
-	expected := "{\"OTelLib\":\"cloudwatch-otel\",\"spanCounter\":0,\"spanName\":\"test\"}"
-
-	assert.Equal(t, expected, *inputLogEvent.InputLogEvent.Message)
-}
-
 func BenchmarkTranslateOtToGroupedMetricWithInstrLibrary(b *testing.B) {
-	oc := createMetricTestData()
-	rm := internaldata.OCToMetrics(oc.Node, oc.Resource, oc.Metrics).ResourceMetrics().At(0)
-	ilms := rm.InstrumentationLibraryMetrics()
+	rm := createTestResourceMetrics()
+	ilms := rm.ScopeMetrics()
 	ilm := ilms.At(0)
-	ilm.InstrumentationLibrary().SetName("cloudwatch-lib")
+	ilm.Scope().SetName("cloudwatch-lib")
 	config := &Config{
 		Namespace:             "",
 		DimensionRollupOption: zeroAndSingleDimensionRollup,
 		logger:                zap.NewNop(),
 	}
 	translator := newMetricTranslator(*config)
+	defer require.NoError(b, translator.Shutdown())
 
 	b.ResetTimer()
 	for n := 0; n < b.N; n++ {
-		groupedMetric := make(map[interface{}]*groupedMetric)
-		translator.translateOTelToGroupedMetric(&rm, groupedMetric, config)
+		groupedMetric := make(map[any]*groupedMetric)
+		err := translator.translateOTelToGroupedMetric(rm, groupedMetric, config)
+		assert.NoError(b, err)
 	}
 }
 
 func BenchmarkTranslateOtToGroupedMetricWithoutConfigReplacePattern(b *testing.B) {
-	oc := createMetricTestData()
-	rm := internaldata.OCToMetrics(oc.Node, oc.Resource, oc.Metrics).ResourceMetrics().At(0)
-	ilms := rm.InstrumentationLibraryMetrics()
+	rm := createTestResourceMetrics()
+	ilms := rm.ScopeMetrics()
 	ilm := ilms.At(0)
-	ilm.InstrumentationLibrary().SetName("cloudwatch-lib")
+	ilm.Scope().SetName("cloudwatch-lib")
 	config := &Config{
 		Namespace:             "",
 		DimensionRollupOption: zeroAndSingleDimensionRollup,
@@ -2086,20 +2026,21 @@ func BenchmarkTranslateOtToGroupedMetricWithoutConfigReplacePattern(b *testing.B
 		logger:                zap.NewNop(),
 	}
 	translator := newMetricTranslator(*config)
+	defer require.NoError(b, translator.Shutdown())
 
 	b.ResetTimer()
 	for n := 0; n < b.N; n++ {
-		groupedMetrics := make(map[interface{}]*groupedMetric)
-		translator.translateOTelToGroupedMetric(&rm, groupedMetrics, config)
+		groupedMetrics := make(map[any]*groupedMetric)
+		err := translator.translateOTelToGroupedMetric(rm, groupedMetrics, config)
+		assert.NoError(b, err)
 	}
 }
 
 func BenchmarkTranslateOtToGroupedMetricWithConfigReplaceWithResource(b *testing.B) {
-	oc := createMetricTestData()
-	rm := internaldata.OCToMetrics(oc.Node, oc.Resource, oc.Metrics).ResourceMetrics().At(0)
-	ilms := rm.InstrumentationLibraryMetrics()
+	rm := createTestResourceMetrics()
+	ilms := rm.ScopeMetrics()
 	ilm := ilms.At(0)
-	ilm.InstrumentationLibrary().SetName("cloudwatch-lib")
+	ilm.Scope().SetName("cloudwatch-lib")
 	config := &Config{
 		Namespace:             "",
 		DimensionRollupOption: zeroAndSingleDimensionRollup,
@@ -2108,20 +2049,21 @@ func BenchmarkTranslateOtToGroupedMetricWithConfigReplaceWithResource(b *testing
 		logger:                zap.NewNop(),
 	}
 	translator := newMetricTranslator(*config)
+	defer require.NoError(b, translator.Shutdown())
 
 	b.ResetTimer()
 	for n := 0; n < b.N; n++ {
-		groupedMetrics := make(map[interface{}]*groupedMetric)
-		translator.translateOTelToGroupedMetric(&rm, groupedMetrics, config)
+		groupedMetrics := make(map[any]*groupedMetric)
+		err := translator.translateOTelToGroupedMetric(rm, groupedMetrics, config)
+		assert.NoError(b, err)
 	}
 }
 
 func BenchmarkTranslateOtToGroupedMetricWithConfigReplaceWithLabel(b *testing.B) {
-	oc := createMetricTestData()
-	rm := internaldata.OCToMetrics(oc.Node, oc.Resource, oc.Metrics).ResourceMetrics().At(0)
-	ilms := rm.InstrumentationLibraryMetrics()
+	rm := createTestResourceMetrics()
+	ilms := rm.ScopeMetrics()
 	ilm := ilms.At(0)
-	ilm.InstrumentationLibrary().SetName("cloudwatch-lib")
+	ilm.Scope().SetName("cloudwatch-lib")
 	config := &Config{
 		Namespace:             "",
 		DimensionRollupOption: zeroAndSingleDimensionRollup,
@@ -2130,28 +2072,31 @@ func BenchmarkTranslateOtToGroupedMetricWithConfigReplaceWithLabel(b *testing.B)
 		logger:                zap.NewNop(),
 	}
 	translator := newMetricTranslator(*config)
+	defer require.NoError(b, translator.Shutdown())
 
 	b.ResetTimer()
 	for n := 0; n < b.N; n++ {
-		groupedMetrics := make(map[interface{}]*groupedMetric)
-		translator.translateOTelToGroupedMetric(&rm, groupedMetrics, config)
+		groupedMetrics := make(map[any]*groupedMetric)
+		err := translator.translateOTelToGroupedMetric(rm, groupedMetrics, config)
+		assert.NoError(b, err)
 	}
 }
 
 func BenchmarkTranslateOtToGroupedMetricWithoutInstrLibrary(b *testing.B) {
-	oc := createMetricTestData()
-	rm := internaldata.OCToMetrics(oc.Node, oc.Resource, oc.Metrics).ResourceMetrics().At(0)
+	rm := createTestResourceMetrics()
 	config := &Config{
 		Namespace:             "",
 		DimensionRollupOption: zeroAndSingleDimensionRollup,
 		logger:                zap.NewNop(),
 	}
 	translator := newMetricTranslator(*config)
+	defer require.NoError(b, translator.Shutdown())
 
 	b.ResetTimer()
 	for n := 0; n < b.N; n++ {
-		groupedMetrics := make(map[interface{}]*groupedMetric)
-		translator.translateOTelToGroupedMetric(&rm, groupedMetrics, config)
+		groupedMetrics := make(map[any]*groupedMetric)
+		err := translator.translateOTelToGroupedMetric(rm, groupedMetrics, config)
+		assert.NoError(b, err)
 	}
 }
 
@@ -2219,7 +2164,8 @@ func BenchmarkTranslateGroupedMetricToCWMetricWithFiltering(b *testing.B) {
 		MetricNameSelectors: []string{"metric1", "metric2"},
 	}
 	logger := zap.NewNop()
-	m.init(logger)
+	err := m.init(logger)
+	assert.NoError(b, err)
 	config := &Config{
 		MetricDeclarations:    []*MetricDeclaration{m},
 		DimensionRollupOption: zeroAndSingleDimensionRollup,
@@ -2235,13 +2181,13 @@ func BenchmarkTranslateCWMetricToEMF(b *testing.B) {
 	cwMeasurement := cWMeasurement{
 		Namespace:  "test-emf",
 		Dimensions: [][]string{{oTellibDimensionKey}, {oTellibDimensionKey, "spanName"}},
-		Metrics: []map[string]string{{
-			"Name": "spanCounter",
-			"Unit": "Count",
+		Metrics: []cWMetricInfo{{
+			Name: "spanCounter",
+			Unit: "Count",
 		}},
 	}
 	timestamp := int64(1596151098037)
-	fields := make(map[string]interface{})
+	fields := make(map[string]any)
 	fields[oTellibDimensionKey] = "cloudwatch-otel"
 	fields["spanName"] = "test"
 	fields["spanCounter"] = 0
@@ -2254,143 +2200,142 @@ func BenchmarkTranslateCWMetricToEMF(b *testing.B) {
 
 	b.ResetTimer()
 	for n := 0; n < b.N; n++ {
-		translateCWMetricToEMF(met, &Config{})
+		_, err := translateCWMetricToEMF(met, &Config{})
+		require.NoError(b, err)
 	}
 }
 
 type testMetric struct {
 	metricNames          []string
 	metricValues         [][]float64
-	resourceAttributeMap map[string]pdata.AttributeValue
-	attributeMap         map[string]pdata.AttributeValue
+	resourceAttributeMap map[string]any
+	attributeMap         map[string]any
 }
 
 type logGroupStreamTest struct {
 	name             string
-	inputMetrics     pdata.Metrics
+	inputMetrics     pmetric.Metrics
 	inLogGroupName   string
 	inLogStreamName  string
 	outLogGroupName  string
 	outLogStreamName string
 }
 
-var (
-	logGroupStreamTestCases = []logGroupStreamTest{
-		{
-			name: "log_group_stream_expect_same",
-			inputMetrics: generateTestMetrics(testMetric{
-				metricNames:  []string{"metric_1", "metric_2"},
-				metricValues: [][]float64{{100}, {4}},
-			}),
-			inLogGroupName:   "test-log-group",
-			inLogStreamName:  "test-log-stream",
-			outLogGroupName:  "test-log-group",
-			outLogStreamName: "test-log-stream",
-		},
-		{
-			name: "log_group_pattern_from_resource",
-			inputMetrics: generateTestMetrics(testMetric{
-				metricNames:  []string{"metric_1", "metric_2"},
-				metricValues: [][]float64{{100}, {4}},
-				resourceAttributeMap: map[string]pdata.AttributeValue{
-					"ClusterName": pdata.NewAttributeValueString("test-cluster"),
-					"PodName":     pdata.NewAttributeValueString("test-pod"),
-				},
-			}),
-			inLogGroupName:   "test-log-group-{ClusterName}",
-			inLogStreamName:  "test-log-stream",
-			outLogGroupName:  "test-log-group-test-cluster",
-			outLogStreamName: "test-log-stream",
-		},
-		{
-			name: "log_stream_pattern_from_resource",
-			inputMetrics: generateTestMetrics(testMetric{
-				metricNames:  []string{"metric_1", "metric_2"},
-				metricValues: [][]float64{{100}, {4}},
-				resourceAttributeMap: map[string]pdata.AttributeValue{
-					"ClusterName": pdata.NewAttributeValueString("test-cluster"),
-					"PodName":     pdata.NewAttributeValueString("test-pod"),
-				},
-			}),
-			inLogGroupName:   "test-log-group",
-			inLogStreamName:  "test-log-stream-{PodName}",
-			outLogGroupName:  "test-log-group",
-			outLogStreamName: "test-log-stream-test-pod",
-		},
-		{
-			name: "log_group_pattern_from_label",
-			inputMetrics: generateTestMetrics(testMetric{
-				metricNames:  []string{"metric_1", "metric_2"},
-				metricValues: [][]float64{{100}, {4}},
-				attributeMap: map[string]pdata.AttributeValue{
-					"ClusterName": pdata.NewAttributeValueString("test-cluster"),
-					"PodName":     pdata.NewAttributeValueString("test-pod"),
-				},
-			}),
-			inLogGroupName:   "test-log-group-{ClusterName}",
-			inLogStreamName:  "test-log-stream",
-			outLogGroupName:  "test-log-group-test-cluster",
-			outLogStreamName: "test-log-stream",
-		},
-		{
-			name: "log_stream_pattern_from_label",
-			inputMetrics: generateTestMetrics(testMetric{
-				metricNames:  []string{"metric_1", "metric_2"},
-				metricValues: [][]float64{{100}, {4}},
-				attributeMap: map[string]pdata.AttributeValue{
-					"ClusterName": pdata.NewAttributeValueString("test-cluster"),
-					"PodName":     pdata.NewAttributeValueString("test-pod"),
-				},
-			}),
-			inLogGroupName:   "test-log-group",
-			inLogStreamName:  "test-log-stream-{PodName}",
-			outLogGroupName:  "test-log-group",
-			outLogStreamName: "test-log-stream-test-pod",
-		},
-		{
-			name: "config_pattern_from_both_attributes",
-			inputMetrics: generateTestMetrics(testMetric{
-				metricNames:  []string{"metric_1", "metric_2"},
-				metricValues: [][]float64{{100}, {4}},
-				resourceAttributeMap: map[string]pdata.AttributeValue{
-					"ClusterName": pdata.NewAttributeValueString("test-cluster"),
-				},
-				attributeMap: map[string]pdata.AttributeValue{
-					"PodName": pdata.NewAttributeValueString("test-pod"),
-				},
-			}),
-			inLogGroupName:   "test-log-group-{ClusterName}",
-			inLogStreamName:  "test-log-stream-{PodName}",
-			outLogGroupName:  "test-log-group-test-cluster",
-			outLogStreamName: "test-log-stream-test-pod",
-		},
-		{
-			name: "config_pattern_missing_from_both_attributes",
-			inputMetrics: generateTestMetrics(testMetric{
-				metricNames:  []string{"metric_1", "metric_2"},
-				metricValues: [][]float64{{100}, {4}},
-			}),
-			inLogGroupName:   "test-log-group-{ClusterName}",
-			inLogStreamName:  "test-log-stream-{PodName}",
-			outLogGroupName:  "test-log-group-undefined",
-			outLogStreamName: "test-log-stream-undefined",
-		},
-		{
-			name: "config_pattern_group_missing_stream_present",
-			inputMetrics: generateTestMetrics(testMetric{
-				metricNames:  []string{"metric_1", "metric_2"},
-				metricValues: [][]float64{{100}, {4}},
-				attributeMap: map[string]pdata.AttributeValue{
-					"PodName": pdata.NewAttributeValueString("test-pod"),
-				},
-			}),
-			inLogGroupName:   "test-log-group-{ClusterName}",
-			inLogStreamName:  "test-log-stream-{PodName}",
-			outLogGroupName:  "test-log-group-undefined",
-			outLogStreamName: "test-log-stream-test-pod",
-		},
-	}
-)
+var logGroupStreamTestCases = []logGroupStreamTest{
+	{
+		name: "log_group_stream_expect_same",
+		inputMetrics: generateTestMetrics(testMetric{
+			metricNames:  []string{"metric_1", "metric_2"},
+			metricValues: [][]float64{{100}, {4}},
+		}),
+		inLogGroupName:   "test-log-group",
+		inLogStreamName:  "test-log-stream",
+		outLogGroupName:  "test-log-group",
+		outLogStreamName: "test-log-stream",
+	},
+	{
+		name: "log_group_pattern_from_resource",
+		inputMetrics: generateTestMetrics(testMetric{
+			metricNames:  []string{"metric_1", "metric_2"},
+			metricValues: [][]float64{{100}, {4}},
+			resourceAttributeMap: map[string]any{
+				"ClusterName": "test-cluster",
+				"PodName":     "test-pod",
+			},
+		}),
+		inLogGroupName:   "test-log-group-{ClusterName}",
+		inLogStreamName:  "test-log-stream",
+		outLogGroupName:  "test-log-group-test-cluster",
+		outLogStreamName: "test-log-stream",
+	},
+	{
+		name: "log_stream_pattern_from_resource",
+		inputMetrics: generateTestMetrics(testMetric{
+			metricNames:  []string{"metric_1", "metric_2"},
+			metricValues: [][]float64{{100}, {4}},
+			resourceAttributeMap: map[string]any{
+				"ClusterName": "test-cluster",
+				"PodName":     "test-pod",
+			},
+		}),
+		inLogGroupName:   "test-log-group",
+		inLogStreamName:  "test-log-stream-{PodName}",
+		outLogGroupName:  "test-log-group",
+		outLogStreamName: "test-log-stream-test-pod",
+	},
+	{
+		name: "log_group_pattern_from_label",
+		inputMetrics: generateTestMetrics(testMetric{
+			metricNames:  []string{"metric_1", "metric_2"},
+			metricValues: [][]float64{{100}, {4}},
+			attributeMap: map[string]any{
+				"ClusterName": "test-cluster",
+				"PodName":     "test-pod",
+			},
+		}),
+		inLogGroupName:   "test-log-group-{ClusterName}",
+		inLogStreamName:  "test-log-stream",
+		outLogGroupName:  "test-log-group-test-cluster",
+		outLogStreamName: "test-log-stream",
+	},
+	{
+		name: "log_stream_pattern_from_label",
+		inputMetrics: generateTestMetrics(testMetric{
+			metricNames:  []string{"metric_1", "metric_2"},
+			metricValues: [][]float64{{100}, {4}},
+			attributeMap: map[string]any{
+				"ClusterName": "test-cluster",
+				"PodName":     "test-pod",
+			},
+		}),
+		inLogGroupName:   "test-log-group",
+		inLogStreamName:  "test-log-stream-{PodName}",
+		outLogGroupName:  "test-log-group",
+		outLogStreamName: "test-log-stream-test-pod",
+	},
+	{
+		name: "config_pattern_from_both_attributes",
+		inputMetrics: generateTestMetrics(testMetric{
+			metricNames:  []string{"metric_1", "metric_2"},
+			metricValues: [][]float64{{100}, {4}},
+			resourceAttributeMap: map[string]any{
+				"ClusterName": "test-cluster",
+			},
+			attributeMap: map[string]any{
+				"PodName": "test-pod",
+			},
+		}),
+		inLogGroupName:   "test-log-group-{ClusterName}",
+		inLogStreamName:  "test-log-stream-{PodName}",
+		outLogGroupName:  "test-log-group-test-cluster",
+		outLogStreamName: "test-log-stream-test-pod",
+	},
+	{
+		name: "config_pattern_missing_from_both_attributes",
+		inputMetrics: generateTestMetrics(testMetric{
+			metricNames:  []string{"metric_1", "metric_2"},
+			metricValues: [][]float64{{100}, {4}},
+		}),
+		inLogGroupName:   "test-log-group-{ClusterName}",
+		inLogStreamName:  "test-log-stream-{PodName}",
+		outLogGroupName:  "test-log-group-undefined",
+		outLogStreamName: "test-log-stream-undefined",
+	},
+	{
+		name: "config_pattern_group_missing_stream_present",
+		inputMetrics: generateTestMetrics(testMetric{
+			metricNames:  []string{"metric_1", "metric_2"},
+			metricValues: [][]float64{{100}, {4}},
+			attributeMap: map[string]any{
+				"PodName": "test-pod",
+			},
+		}),
+		inLogGroupName:   "test-log-group-{ClusterName}",
+		inLogStreamName:  "test-log-stream-{PodName}",
+		outLogGroupName:  "test-log-group-undefined",
+		outLogStreamName: "test-log-stream-test-pod",
+	},
+}
 
 func TestTranslateOtToGroupedMetricForLogGroupAndStream(t *testing.T) {
 	for _, test := range logGroupStreamTestCases {
@@ -2404,14 +2349,16 @@ func TestTranslateOtToGroupedMetricForLogGroupAndStream(t *testing.T) {
 			}
 
 			translator := newMetricTranslator(*config)
+			defer require.NoError(t, translator.Shutdown())
 
-			groupedMetrics := make(map[interface{}]*groupedMetric)
+			groupedMetrics := make(map[any]*groupedMetric)
 
 			rm := test.inputMetrics.ResourceMetrics().At(0)
-			translator.translateOTelToGroupedMetric(&rm, groupedMetrics, config)
+			err := translator.translateOTelToGroupedMetric(rm, groupedMetrics, config)
+			assert.NoError(t, err)
 
 			assert.NotNil(t, groupedMetrics)
-			assert.Equal(t, 1, len(groupedMetrics))
+			assert.Len(t, groupedMetrics, 1)
 
 			for _, actual := range groupedMetrics {
 				assert.Equal(t, test.outLogGroupName, actual.metadata.logGroup)
@@ -2421,23 +2368,55 @@ func TestTranslateOtToGroupedMetricForLogGroupAndStream(t *testing.T) {
 	}
 }
 
-func generateTestMetrics(tm testMetric) pdata.Metrics {
-	md := pdata.NewMetrics()
+func TestTranslateOtToGroupedMetricForInitialDeltaValue(t *testing.T) {
+	for _, test := range logGroupStreamTestCases {
+		t.Run(test.name, func(t *testing.T) {
+			config := &Config{
+				Namespace:                       "",
+				LogGroupName:                    test.inLogGroupName,
+				LogStreamName:                   test.inLogStreamName,
+				DimensionRollupOption:           zeroAndSingleDimensionRollup,
+				logger:                          zap.NewNop(),
+				RetainInitialValueOfDeltaMetric: true,
+			}
+
+			translator := newMetricTranslator(*config)
+
+			groupedMetrics := make(map[any]*groupedMetric)
+
+			rm := test.inputMetrics.ResourceMetrics().At(0)
+			err := translator.translateOTelToGroupedMetric(rm, groupedMetrics, config)
+			assert.NoError(t, err)
+
+			assert.NotNil(t, groupedMetrics)
+			assert.Len(t, groupedMetrics, 1)
+
+			for _, actual := range groupedMetrics {
+				assert.True(t, actual.metadata.retainInitialValueForDelta)
+			}
+		})
+	}
+}
+
+func generateTestMetrics(tm testMetric) pmetric.Metrics {
+	md := pmetric.NewMetrics()
 	now := time.Now()
 
 	rm := md.ResourceMetrics().AppendEmpty()
-	pdata.NewAttributeMapFromMap(tm.resourceAttributeMap).CopyTo(rm.Resource().Attributes())
-	ms := rm.InstrumentationLibraryMetrics().AppendEmpty().Metrics()
+	//nolint:errcheck
+	rm.Resource().Attributes().FromRaw(tm.resourceAttributeMap)
+	ms := rm.ScopeMetrics().AppendEmpty().Metrics()
 
 	for i, name := range tm.metricNames {
 		m := ms.AppendEmpty()
 		m.SetName(name)
-		m.SetDataType(pdata.MetricDataTypeGauge)
+		g := m.SetEmptyGauge()
 		for _, value := range tm.metricValues[i] {
-			dp := m.Gauge().DataPoints().AppendEmpty()
-			dp.SetTimestamp(pdata.NewTimestampFromTime(now.Add(10 * time.Second)))
-			dp.SetDoubleVal(value)
-			pdata.NewAttributeMapFromMap(tm.attributeMap).CopyTo(dp.Attributes())
+			dp := g.DataPoints().AppendEmpty()
+			dp.SetTimestamp(pcommon.NewTimestampFromTime(now.Add(10 * time.Second)))
+			dp.SetDoubleValue(value)
+			//nolint:errcheck
+			dp.Attributes().FromRaw(tm.attributeMap)
 		}
 	}
 	return md

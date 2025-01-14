@@ -1,29 +1,37 @@
-// Copyright  The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
 
 package postgresqlreceiver // import "github.com/open-telemetry/opentelemetry-collector-contrib/receiver/postgresqlreceiver"
 
 import (
 	"context"
-	"strconv"
+	"errors"
+	"fmt"
+	"sync"
 	"time"
 
-	"go.opentelemetry.io/collector/model/pdata"
-	"go.opentelemetry.io/collector/receiver/scrapererror"
+	"go.opentelemetry.io/collector/featuregate"
+	"go.opentelemetry.io/collector/pdata/pcommon"
+	"go.opentelemetry.io/collector/pdata/pmetric"
+	"go.opentelemetry.io/collector/receiver"
+	"go.opentelemetry.io/collector/scraper/scrapererror"
 	"go.uber.org/zap"
 
 	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/postgresqlreceiver/internal/metadata"
+)
+
+const (
+	readmeURL            = "https://github.com/open-telemetry/opentelemetry-collector-contrib/blob/v0.88.0/receiver/postgresqlreceiver/README.md"
+	separateSchemaAttrID = "receiver.postgresql.separateSchemaAttr"
+
+	defaultPostgreSQLDatabase = "postgres"
+)
+
+var separateSchemaAttrGate = featuregate.GlobalRegistry().MustRegister(
+	separateSchemaAttrID,
+	featuregate.StageAlpha,
+	featuregate.WithRegisterDescription("Moves Schema Names into dedicated Attribute"),
+	featuregate.WithRegisterReferenceURL("https://github.com/open-telemetry/opentelemetry-collector-contrib/issues/29559"),
 )
 
 type postgreSQLScraper struct {
@@ -31,265 +39,431 @@ type postgreSQLScraper struct {
 	config        *Config
 	clientFactory postgreSQLClientFactory
 	mb            *metadata.MetricsBuilder
+	excludes      map[string]struct{}
+
+	// if enabled, uses a separated attribute for the schema
+	separateSchemaAttr bool
 }
 
-type postgreSQLClientFactory interface {
-	getClient(c *Config, database string) (client, error)
+type errsMux struct {
+	sync.RWMutex
+	errs scrapererror.ScrapeErrors
 }
 
-type defaultClientFactory struct{}
+func (e *errsMux) add(err error) {
+	e.Lock()
+	defer e.Unlock()
+	e.errs.Add(err)
+}
 
-func (d *defaultClientFactory) getClient(c *Config, database string) (client, error) {
-	return newPostgreSQLClient(postgreSQLConfig{
-		username: c.Username,
-		password: c.Password,
-		database: database,
-		tls:      c.TLSClientSetting,
-		address:  c.NetAddr,
-	})
+func (e *errsMux) addPartial(err error) {
+	e.Lock()
+	defer e.Unlock()
+	e.errs.AddPartial(1, err)
+}
+
+func (e *errsMux) combine() error {
+	e.Lock()
+	defer e.Unlock()
+	return e.errs.Combine()
 }
 
 func newPostgreSQLScraper(
-	logger *zap.Logger,
+	settings receiver.Settings,
 	config *Config,
 	clientFactory postgreSQLClientFactory,
 ) *postgreSQLScraper {
+	excludes := make(map[string]struct{})
+	for _, db := range config.ExcludeDatabases {
+		excludes[db] = struct{}{}
+	}
+	separateSchemaAttr := separateSchemaAttrGate.IsEnabled()
+
+	if !separateSchemaAttr {
+		settings.Logger.Warn(
+			fmt.Sprintf("Feature gate %s is not enabled. Please see the README for more information: %s", separateSchemaAttrID, readmeURL),
+		)
+	}
+
 	return &postgreSQLScraper{
-		logger:        logger,
+		logger:        settings.Logger,
 		config:        config,
 		clientFactory: clientFactory,
-		mb:            metadata.NewMetricsBuilder(config.Metrics),
+		mb:            metadata.NewMetricsBuilder(config.MetricsBuilderConfig, settings),
+		excludes:      excludes,
+
+		separateSchemaAttr: separateSchemaAttr,
 	}
 }
 
+type dbRetrieval struct {
+	sync.RWMutex
+	activityMap map[databaseName]int64
+	dbSizeMap   map[databaseName]int64
+	dbStats     map[databaseName]databaseStats
+}
+
 // scrape scrapes the metric stats, transforms them and attributes them into a metric slices.
-func (p *postgreSQLScraper) scrape(ctx context.Context) (pdata.Metrics, error) {
+func (p *postgreSQLScraper) scrape(ctx context.Context) (pmetric.Metrics, error) {
 	databases := p.config.Databases
-	listClient, err := p.clientFactory.getClient(p.config, "")
+	listClient, err := p.clientFactory.getClient(defaultPostgreSQLDatabase)
 	if err != nil {
 		p.logger.Error("Failed to initialize connection to postgres", zap.Error(err))
-		return pdata.NewMetrics(), err
+		return pmetric.NewMetrics(), err
 	}
 	defer listClient.Close()
 
 	if len(databases) == 0 {
-		dbList, err := listClient.listDatabases(ctx)
-		if err != nil {
-			p.logger.Error("Failed to request list of databases from postgres", zap.Error(err))
-			return pdata.NewMetrics(), err
+		dbList, dbErr := listClient.listDatabases(ctx)
+		if dbErr != nil {
+			p.logger.Error("Failed to request list of databases from postgres", zap.Error(dbErr))
+			return pmetric.NewMetrics(), dbErr
 		}
 		databases = dbList
 	}
+	var filteredDatabases []string
+	for _, db := range databases {
+		if _, ok := p.excludes[db]; !ok {
+			filteredDatabases = append(filteredDatabases, db)
+		}
+	}
+	databases = filteredDatabases
 
-	// metric initialization
-	md := pdata.NewMetrics()
-	ilm := md.ResourceMetrics().AppendEmpty().InstrumentationLibraryMetrics().AppendEmpty()
-	ilm.InstrumentationLibrary().SetName("otelcol/postgresql")
-	now := pdata.NewTimestampFromTime(time.Now())
+	now := pcommon.NewTimestampFromTime(time.Now())
 
-	var errors scrapererror.ScrapeErrors
-
-	p.collectCommitsAndRollbacks(ctx, now, listClient, databases, errors)
-	p.collectDatabaseSize(ctx, now, listClient, databases, errors)
-	p.collectBackends(ctx, now, listClient, databases, errors)
+	var errs errsMux
+	r := &dbRetrieval{
+		activityMap: make(map[databaseName]int64),
+		dbSizeMap:   make(map[databaseName]int64),
+		dbStats:     make(map[databaseName]databaseStats),
+	}
+	p.retrieveDBMetrics(ctx, listClient, databases, r, &errs)
 
 	for _, database := range databases {
-		dbClient, err := p.clientFactory.getClient(p.config, database)
-		if err != nil {
-			errors.Add(err)
-			p.logger.Error("Failed to initialize connection to postgres", zap.String("database", database), zap.Error(err))
+		dbClient, dbErr := p.clientFactory.getClient(database)
+		if dbErr != nil {
+			errs.add(dbErr)
+			p.logger.Error("Failed to initialize connection to postgres", zap.String("database", database), zap.Error(dbErr))
 			continue
 		}
 		defer dbClient.Close()
+		numTables := p.collectTables(ctx, now, dbClient, database, &errs)
 
-		p.collectBlockReads(ctx, now, dbClient, errors)
-		p.collectDatabaseTableMetrics(ctx, now, dbClient, errors)
+		p.recordDatabase(now, database, r, numTables)
+		p.collectIndexes(ctx, now, dbClient, database, &errs)
 	}
 
-	p.mb.Emit(ilm.Metrics())
-	return md, errors.Combine()
+	p.mb.RecordPostgresqlDatabaseCountDataPoint(now, int64(len(databases)))
+	p.collectBGWriterStats(ctx, now, listClient, &errs)
+	p.collectWalAge(ctx, now, listClient, &errs)
+	p.collectReplicationStats(ctx, now, listClient, &errs)
+	p.collectMaxConnections(ctx, now, listClient, &errs)
+	p.collectDatabaseLocks(ctx, now, listClient, &errs)
+
+	return p.mb.Emit(), errs.combine()
 }
 
-func (p *postgreSQLScraper) collectBlockReads(
+func (p *postgreSQLScraper) shutdown(_ context.Context) error {
+	if p.clientFactory != nil {
+		p.clientFactory.close()
+	}
+	return nil
+}
+
+func (p *postgreSQLScraper) retrieveDBMetrics(
 	ctx context.Context,
-	now pdata.Timestamp,
-	client client,
-	errors scrapererror.ScrapeErrors,
+	listClient client,
+	databases []string,
+	r *dbRetrieval,
+	errs *errsMux,
 ) {
-	blocksReadByTableMetrics, err := client.getBlocksReadByTable(ctx)
+	wg := &sync.WaitGroup{}
+
+	wg.Add(3)
+	go p.retrieveBackends(ctx, wg, listClient, databases, r, errs)
+	go p.retrieveDatabaseSize(ctx, wg, listClient, databases, r, errs)
+	go p.retrieveDatabaseStats(ctx, wg, listClient, databases, r, errs)
+
+	wg.Wait()
+}
+
+func (p *postgreSQLScraper) recordDatabase(now pcommon.Timestamp, db string, r *dbRetrieval, numTables int64) {
+	dbName := databaseName(db)
+	p.mb.RecordPostgresqlTableCountDataPoint(now, numTables)
+	if activeConnections, ok := r.activityMap[dbName]; ok {
+		p.mb.RecordPostgresqlBackendsDataPoint(now, activeConnections)
+	}
+	if size, ok := r.dbSizeMap[dbName]; ok {
+		p.mb.RecordPostgresqlDbSizeDataPoint(now, size)
+	}
+	if stats, ok := r.dbStats[dbName]; ok {
+		p.mb.RecordPostgresqlCommitsDataPoint(now, stats.transactionCommitted)
+		p.mb.RecordPostgresqlRollbacksDataPoint(now, stats.transactionRollback)
+		p.mb.RecordPostgresqlDeadlocksDataPoint(now, stats.deadlocks)
+		p.mb.RecordPostgresqlTempFilesDataPoint(now, stats.tempFiles)
+		p.mb.RecordPostgresqlTupUpdatedDataPoint(now, stats.tupUpdated)
+		p.mb.RecordPostgresqlTupReturnedDataPoint(now, stats.tupReturned)
+		p.mb.RecordPostgresqlTupFetchedDataPoint(now, stats.tupFetched)
+		p.mb.RecordPostgresqlTupInsertedDataPoint(now, stats.tupInserted)
+		p.mb.RecordPostgresqlTupDeletedDataPoint(now, stats.tupDeleted)
+		p.mb.RecordPostgresqlBlksHitDataPoint(now, stats.blksHit)
+		p.mb.RecordPostgresqlBlksReadDataPoint(now, stats.blksRead)
+	}
+	rb := p.mb.NewResourceBuilder()
+	rb.SetPostgresqlDatabaseName(db)
+	p.mb.EmitForResource(metadata.WithResource(rb.Emit()))
+}
+
+func (p *postgreSQLScraper) collectTables(ctx context.Context, now pcommon.Timestamp, dbClient client, db string, errs *errsMux) (numTables int64) {
+	blockReads, err := dbClient.getBlocksReadByTable(ctx, db)
 	if err != nil {
-		p.logger.Error("Errors encountered while fetching blocks read by table", zap.Error(err))
-		errors.AddPartial(0, err)
+		errs.addPartial(err)
 	}
 
-	// Metrics can be partially collected (non-nil) even if there were partial errors reported
-	if blocksReadByTableMetrics == nil {
+	tableMetrics, err := dbClient.getDatabaseTableMetrics(ctx, db)
+	if err != nil {
+		errs.addPartial(err)
+	}
+
+	for tableKey, tm := range tableMetrics {
+		p.mb.RecordPostgresqlRowsDataPoint(now, tm.dead, metadata.AttributeStateDead)
+		p.mb.RecordPostgresqlRowsDataPoint(now, tm.live, metadata.AttributeStateLive)
+		p.mb.RecordPostgresqlOperationsDataPoint(now, tm.inserts, metadata.AttributeOperationIns)
+		p.mb.RecordPostgresqlOperationsDataPoint(now, tm.del, metadata.AttributeOperationDel)
+		p.mb.RecordPostgresqlOperationsDataPoint(now, tm.upd, metadata.AttributeOperationUpd)
+		p.mb.RecordPostgresqlOperationsDataPoint(now, tm.hotUpd, metadata.AttributeOperationHotUpd)
+		p.mb.RecordPostgresqlTableSizeDataPoint(now, tm.size)
+		p.mb.RecordPostgresqlTableVacuumCountDataPoint(now, tm.vacuumCount)
+		p.mb.RecordPostgresqlSequentialScansDataPoint(now, tm.seqScans)
+
+		br, ok := blockReads[tableKey]
+		if ok {
+			p.mb.RecordPostgresqlBlocksReadDataPoint(now, br.heapRead, metadata.AttributeSourceHeapRead)
+			p.mb.RecordPostgresqlBlocksReadDataPoint(now, br.heapHit, metadata.AttributeSourceHeapHit)
+			p.mb.RecordPostgresqlBlocksReadDataPoint(now, br.idxRead, metadata.AttributeSourceIdxRead)
+			p.mb.RecordPostgresqlBlocksReadDataPoint(now, br.idxHit, metadata.AttributeSourceIdxHit)
+			p.mb.RecordPostgresqlBlocksReadDataPoint(now, br.toastHit, metadata.AttributeSourceToastHit)
+			p.mb.RecordPostgresqlBlocksReadDataPoint(now, br.toastRead, metadata.AttributeSourceToastRead)
+			p.mb.RecordPostgresqlBlocksReadDataPoint(now, br.tidxRead, metadata.AttributeSourceTidxRead)
+			p.mb.RecordPostgresqlBlocksReadDataPoint(now, br.tidxHit, metadata.AttributeSourceTidxHit)
+		}
+		rb := p.mb.NewResourceBuilder()
+		rb.SetPostgresqlDatabaseName(db)
+		if p.separateSchemaAttr {
+			rb.SetPostgresqlSchemaName(tm.schema)
+			rb.SetPostgresqlTableName(tm.table)
+		} else {
+			rb.SetPostgresqlTableName(fmt.Sprintf("%s.%s", tm.schema, tm.table))
+		}
+		p.mb.EmitForResource(metadata.WithResource(rb.Emit()))
+	}
+	return int64(len(tableMetrics))
+}
+
+func (p *postgreSQLScraper) collectIndexes(
+	ctx context.Context,
+	now pcommon.Timestamp,
+	client client,
+	database string,
+	errs *errsMux,
+) {
+	idxStats, err := client.getIndexStats(ctx, database)
+	if err != nil {
+		errs.addPartial(err)
 		return
 	}
-	for _, table := range blocksReadByTableMetrics {
-		for k, v := range table.stats {
-			i, err := p.parseInt(k, v)
-			if err != nil {
-				errors.AddPartial(0, err)
-				continue
-			}
-			p.mb.RecordPostgresqlBlocksReadDataPoint(now, i, table.database, table.table, k)
+
+	for _, stat := range idxStats {
+		p.mb.RecordPostgresqlIndexScansDataPoint(now, stat.scans)
+		p.mb.RecordPostgresqlIndexSizeDataPoint(now, stat.size)
+		rb := p.mb.NewResourceBuilder()
+		rb.SetPostgresqlDatabaseName(database)
+		if p.separateSchemaAttr {
+			rb.SetPostgresqlSchemaName(stat.schema)
+			rb.SetPostgresqlTableName(stat.table)
+		} else {
+			rb.SetPostgresqlTableName(stat.table)
 		}
+		rb.SetPostgresqlIndexName(stat.index)
+		p.mb.EmitForResource(metadata.WithResource(rb.Emit()))
 	}
 }
 
-func (p *postgreSQLScraper) collectDatabaseTableMetrics(
+func (p *postgreSQLScraper) collectBGWriterStats(
 	ctx context.Context,
-	now pdata.Timestamp,
+	now pcommon.Timestamp,
 	client client,
-	errors scrapererror.ScrapeErrors,
+	errs *errsMux,
 ) {
-	databaseTableMetrics, err := client.getDatabaseTableMetrics(ctx)
+	bgStats, err := client.getBGWriterStats(ctx)
 	if err != nil {
-		p.logger.Error("Errors encountered while fetching database table metrics", zap.Error(err))
-		errors.AddPartial(0, err)
-	}
-
-	// Metrics can be partially collected (non-nil) even if there were partial errors reported
-	if databaseTableMetrics == nil {
+		errs.addPartial(err)
 		return
 	}
-	for _, table := range databaseTableMetrics {
-		for _, key := range []string{"live", "dead"} {
-			value, ok := table.stats[key]
-			if !ok {
-				// Data isn't present, error was already logged at a lower level
-				continue
-			}
-			i, err := p.parseInt(key, value)
-			if err != nil {
-				errors.AddPartial(0, err)
-				continue
-			}
-			p.mb.RecordPostgresqlRowsDataPoint(now, i, table.database, table.table, key)
-		}
 
-		for _, key := range []string{"ins", "upd", "del", "hot_upd"} {
-			value, ok := table.stats[key]
-			if !ok {
-				// Data isn't present, error was already logged at a lower level
-				continue
+	p.mb.RecordPostgresqlBgwriterBuffersAllocatedDataPoint(now, bgStats.buffersAllocated)
+
+	p.mb.RecordPostgresqlBgwriterBuffersWritesDataPoint(now, bgStats.bgWrites, metadata.AttributeBgBufferSourceBgwriter)
+	if bgStats.bufferBackendWrites >= 0 {
+		p.mb.RecordPostgresqlBgwriterBuffersWritesDataPoint(now, bgStats.bufferBackendWrites, metadata.AttributeBgBufferSourceBackend)
+	}
+	p.mb.RecordPostgresqlBgwriterBuffersWritesDataPoint(now, bgStats.bufferCheckpoints, metadata.AttributeBgBufferSourceCheckpoints)
+	if bgStats.bufferFsyncWrites >= 0 {
+		p.mb.RecordPostgresqlBgwriterBuffersWritesDataPoint(now, bgStats.bufferFsyncWrites, metadata.AttributeBgBufferSourceBackendFsync)
+	}
+
+	p.mb.RecordPostgresqlBgwriterCheckpointCountDataPoint(now, bgStats.checkpointsReq, metadata.AttributeBgCheckpointTypeRequested)
+	p.mb.RecordPostgresqlBgwriterCheckpointCountDataPoint(now, bgStats.checkpointsScheduled, metadata.AttributeBgCheckpointTypeScheduled)
+
+	p.mb.RecordPostgresqlBgwriterDurationDataPoint(now, bgStats.checkpointSyncTime, metadata.AttributeBgDurationTypeSync)
+	p.mb.RecordPostgresqlBgwriterDurationDataPoint(now, bgStats.checkpointWriteTime, metadata.AttributeBgDurationTypeWrite)
+
+	p.mb.RecordPostgresqlBgwriterMaxwrittenDataPoint(now, bgStats.maxWritten)
+}
+
+func (p *postgreSQLScraper) collectDatabaseLocks(
+	ctx context.Context,
+	now pcommon.Timestamp,
+	client client,
+	errs *errsMux,
+) {
+	dbLocks, err := client.getDatabaseLocks(ctx)
+	if err != nil {
+		p.logger.Error("Errors encountered while fetching database locks", zap.Error(err))
+		errs.addPartial(err)
+		return
+	}
+	for _, dbLock := range dbLocks {
+		p.mb.RecordPostgresqlDatabaseLocksDataPoint(now, dbLock.locks, dbLock.relation, dbLock.mode, dbLock.lockType)
+	}
+}
+
+func (p *postgreSQLScraper) collectMaxConnections(
+	ctx context.Context,
+	now pcommon.Timestamp,
+	client client,
+	errs *errsMux,
+) {
+	mc, err := client.getMaxConnections(ctx)
+	if err != nil {
+		errs.addPartial(err)
+		return
+	}
+	p.mb.RecordPostgresqlConnectionMaxDataPoint(now, mc)
+}
+
+func (p *postgreSQLScraper) collectReplicationStats(
+	ctx context.Context,
+	now pcommon.Timestamp,
+	client client,
+	errs *errsMux,
+) {
+	rss, err := client.getReplicationStats(ctx)
+	if err != nil {
+		errs.addPartial(err)
+		return
+	}
+	for _, rs := range rss {
+		if rs.pendingBytes >= 0 {
+			p.mb.RecordPostgresqlReplicationDataDelayDataPoint(now, rs.pendingBytes, rs.clientAddr)
+		}
+		if preciseLagMetricsFg.IsEnabled() {
+			if rs.writeLag >= 0 {
+				p.mb.RecordPostgresqlWalDelayDataPoint(now, rs.writeLag, metadata.AttributeWalOperationLagWrite, rs.clientAddr)
 			}
-			i, err := p.parseInt(key, value)
-			if err != nil {
-				errors.AddPartial(0, err)
-				continue
+			if rs.replayLag >= 0 {
+				p.mb.RecordPostgresqlWalDelayDataPoint(now, rs.replayLag, metadata.AttributeWalOperationLagReplay, rs.clientAddr)
 			}
-			p.mb.RecordPostgresqlOperationsDataPoint(now, i, table.database, table.table, key)
+			if rs.flushLag >= 0 {
+				p.mb.RecordPostgresqlWalDelayDataPoint(now, rs.flushLag, metadata.AttributeWalOperationLagFlush, rs.clientAddr)
+			}
+		} else {
+			if rs.writeLagInt >= 0 {
+				p.mb.RecordPostgresqlWalLagDataPoint(now, rs.writeLagInt, metadata.AttributeWalOperationLagWrite, rs.clientAddr)
+			}
+			if rs.replayLagInt >= 0 {
+				p.mb.RecordPostgresqlWalLagDataPoint(now, rs.replayLagInt, metadata.AttributeWalOperationLagReplay, rs.clientAddr)
+			}
+			if rs.flushLagInt >= 0 {
+				p.mb.RecordPostgresqlWalLagDataPoint(now, rs.flushLagInt, metadata.AttributeWalOperationLagFlush, rs.clientAddr)
+			}
 		}
 	}
 }
 
-func (p *postgreSQLScraper) collectCommitsAndRollbacks(
+func (p *postgreSQLScraper) collectWalAge(
 	ctx context.Context,
-	now pdata.Timestamp,
+	now pcommon.Timestamp,
+	client client,
+	errs *errsMux,
+) {
+	walAge, err := client.getLatestWalAgeSeconds(ctx)
+	if errors.Is(err, errNoLastArchive) {
+		// return no error as there is no last archive to derive the value from
+		return
+	}
+	if err != nil {
+		errs.addPartial(fmt.Errorf("unable to determine latest WAL age: %w", err))
+		return
+	}
+	p.mb.RecordPostgresqlWalAgeDataPoint(now, walAge)
+}
+
+func (p *postgreSQLScraper) retrieveDatabaseStats(
+	ctx context.Context,
+	wg *sync.WaitGroup,
 	client client,
 	databases []string,
-	errors scrapererror.ScrapeErrors,
+	r *dbRetrieval,
+	errs *errsMux,
 ) {
-	xactMetrics, err := client.getCommitsAndRollbacks(ctx, databases)
+	defer wg.Done()
+	dbStats, err := client.getDatabaseStats(ctx, databases)
 	if err != nil {
 		p.logger.Error("Errors encountered while fetching commits and rollbacks", zap.Error(err))
-		errors.AddPartial(0, err)
-	}
-
-	// Metrics can be partially collected (non-nil) even if there were partial errors reported
-	if xactMetrics == nil {
+		errs.addPartial(err)
 		return
 	}
-	for _, metric := range xactMetrics {
-		commitValue := metric.stats["xact_commit"]
-		if i, err := p.parseInt("xact_commit", commitValue); err != nil {
-			errors.AddPartial(0, err)
-			continue
-		} else {
-			p.mb.RecordPostgresqlCommitsDataPoint(now, i, metric.database)
-		}
-
-		rollbackValue := metric.stats["xact_rollback"]
-		if i, err := p.parseInt("xact_rollback", rollbackValue); err != nil {
-			errors.AddPartial(0, err)
-			continue
-		} else {
-			p.mb.RecordPostgresqlRollbacksDataPoint(now, i, metric.database)
-		}
-	}
+	r.Lock()
+	r.dbStats = dbStats
+	r.Unlock()
 }
 
-func (p *postgreSQLScraper) collectDatabaseSize(
+func (p *postgreSQLScraper) retrieveDatabaseSize(
 	ctx context.Context,
-	now pdata.Timestamp,
+	wg *sync.WaitGroup,
 	client client,
 	databases []string,
-	errors scrapererror.ScrapeErrors,
+	r *dbRetrieval,
+	errs *errsMux,
 ) {
-	databaseSizeMetric, err := client.getDatabaseSize(ctx, databases)
+	defer wg.Done()
+	databaseSizeMetrics, err := client.getDatabaseSize(ctx, databases)
 	if err != nil {
 		p.logger.Error("Errors encountered while fetching database size", zap.Error(err))
-		errors.AddPartial(0, err)
-	}
-
-	// Metrics can be partially collected (non-nil) even if there were partial errors reported
-	if databaseSizeMetric == nil {
+		errs.addPartial(err)
 		return
 	}
-	for _, metric := range databaseSizeMetric {
-		for k, v := range metric.stats {
-			i, err := p.parseInt(k, v)
-			if err != nil {
-				errors.AddPartial(0, err)
-				continue
-			}
-			p.mb.RecordPostgresqlDbSizeDataPoint(now, i, metric.database)
-		}
-	}
+	r.Lock()
+	r.dbSizeMap = databaseSizeMetrics
+	r.Unlock()
 }
 
-func (p *postgreSQLScraper) collectBackends(
+func (p *postgreSQLScraper) retrieveBackends(
 	ctx context.Context,
-	now pdata.Timestamp,
+	wg *sync.WaitGroup,
 	client client,
 	databases []string,
-	errors scrapererror.ScrapeErrors,
+	r *dbRetrieval,
+	errs *errsMux,
 ) {
-	backendsMetric, err := client.getBackends(ctx, databases)
+	defer wg.Done()
+	activityByDB, err := client.getBackends(ctx, databases)
 	if err != nil {
-		p.logger.Error("Errors encountered while fetching backends", zap.Error(err))
-		errors.AddPartial(0, err)
-	}
-
-	// Metrics can be partially collected (non-nil) even if there were partial errors reported
-	if backendsMetric == nil {
+		errs.addPartial(err)
 		return
 	}
-	for _, metric := range backendsMetric {
-		for k, v := range metric.stats {
-			i, err := p.parseInt(k, v)
-			if err != nil {
-				errors.AddPartial(0, err)
-				continue
-			}
-			p.mb.RecordPostgresqlBackendsDataPoint(now, i, metric.database)
-		}
-	}
-}
-
-// parseInt converts string to int64.
-func (p *postgreSQLScraper) parseInt(key, value string) (int64, error) {
-	i, err := strconv.ParseInt(value, 10, 64)
-	if err != nil {
-		p.logger.Info(
-			"invalid value",
-			zap.String("expectedType", "int"),
-			zap.String("key", key),
-			zap.String("value", value),
-		)
-		return 0, err
-	}
-	return i, nil
+	r.Lock()
+	r.activityMap = activityByDB
+	r.Unlock()
 }

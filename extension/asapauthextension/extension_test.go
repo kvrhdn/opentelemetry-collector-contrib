@@ -1,16 +1,5 @@
-// Copyright  The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
 
 package asapauthextension
 
@@ -18,6 +7,7 @@ import (
 	"context"
 	"net/http"
 	"testing"
+	"time"
 
 	"bitbucket.org/atlassian/go-asap/v2"
 	"github.com/stretchr/testify/assert"
@@ -40,7 +30,7 @@ var _ http.RoundTripper = (*mockRoundTripper)(nil)
 // mockKeyFetcher implements asap.KeyFetcher, eliminating the need to contact a key server.
 type mockKeyFetcher struct{}
 
-func (k *mockKeyFetcher) Fetch(_ string) (interface{}, error) {
+func (k *mockKeyFetcher) Fetch(_ string) (any, error) {
 	return asap.NewPublicKey([]byte(publicKey))
 }
 
@@ -49,7 +39,7 @@ var _ asap.KeyFetcher = (*mockKeyFetcher)(nil)
 func TestRoundTripper(t *testing.T) {
 	cfg := &Config{
 		PrivateKey: privateKey,
-		TTL:        60,
+		TTL:        60 * time.Second,
 		Audience:   []string{"test"},
 		Issuer:     "test_issuer",
 		KeyID:      "test_issuer/test_kid",
@@ -63,7 +53,7 @@ func TestRoundTripper(t *testing.T) {
 	assert.NoError(t, err)
 	assert.NotNil(t, roundTripper)
 
-	req := &http.Request{Method: "Get", Header: map[string][]string{}}
+	req := &http.Request{Method: http.MethodGet, Header: map[string][]string{}}
 	resp, err := roundTripper.RoundTrip(req)
 	assert.NoError(t, err)
 	authHeaderValue := resp.Header.Get("Authorization")
@@ -76,7 +66,7 @@ func TestRoundTripper(t *testing.T) {
 func TestRPCAuth(t *testing.T) {
 	cfg := &Config{
 		PrivateKey: privateKey,
-		TTL:        60,
+		TTL:        60 * time.Second,
 		Audience:   []string{"test"},
 		Issuer:     "test_issuer",
 		KeyID:      "test_issuer/test_kid",

@@ -1,16 +1,7 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+
+//go:generate mdatagen metadata.yaml
 
 package googlecloudpubsubexporter // import "github.com/open-telemetry/opentelemetry-collector-contrib/exporter/googlecloudpubsubexporter"
 
@@ -21,67 +12,91 @@ import (
 	"time"
 
 	"go.opentelemetry.io/collector/component"
-	"go.opentelemetry.io/collector/config"
+	"go.opentelemetry.io/collector/consumer"
+	"go.opentelemetry.io/collector/exporter"
 	"go.opentelemetry.io/collector/exporter/exporterhelper"
+	"go.opentelemetry.io/collector/pdata/plog"
+	"go.opentelemetry.io/collector/pdata/pmetric"
+	"go.opentelemetry.io/collector/pdata/ptrace"
+
+	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/googlecloudpubsubexporter/internal/metadata"
 )
 
 const (
-	// The value of "type" key in configuration.
-	typeStr        = "googlecloudpubsub"
 	defaultTimeout = 12 * time.Second
 )
 
-func NewFactory() component.ExporterFactory {
-	return exporterhelper.NewFactory(
-		typeStr,
+// NewFactory creates a factory for Google Cloud Pub/Sub exporter.
+func NewFactory() exporter.Factory {
+	return exporter.NewFactory(
+		metadata.Type,
 		createDefaultConfig,
-		exporterhelper.WithTraces(createTracesExporter),
-		exporterhelper.WithMetrics(createMetricsExporter),
-		exporterhelper.WithLogs(createLogsExporter))
+		exporter.WithTraces(createTracesExporter, metadata.TracesStability),
+		exporter.WithMetrics(createMetricsExporter, metadata.MetricsStability),
+		exporter.WithLogs(createLogsExporter, metadata.LogsStability))
 }
 
 var exporters = map[*Config]*pubsubExporter{}
 
-func ensureExporter(params component.ExporterCreateSettings, pCfg *Config) *pubsubExporter {
+func ensureExporter(params exporter.Settings, pCfg *Config) *pubsubExporter {
 	receiver := exporters[pCfg]
 	if receiver != nil {
 		return receiver
 	}
 	receiver = &pubsubExporter{
-		instanceName: pCfg.ID().Name(),
-		logger:       params.Logger,
-		userAgent:    strings.ReplaceAll(pCfg.UserAgent, "{{version}}", params.BuildInfo.Version),
-		ceSource:     fmt.Sprintf("/opentelemetry/collector/%s/%s", name, params.BuildInfo.Version),
-		config:       pCfg,
-		topicName:    pCfg.Topic,
+		logger:           params.Logger,
+		userAgent:        strings.ReplaceAll(pCfg.UserAgent, "{{version}}", params.BuildInfo.Version),
+		ceSource:         fmt.Sprintf("/opentelemetry/collector/%s/%s", name, params.BuildInfo.Version),
+		config:           pCfg,
+		tracesMarshaler:  &ptrace.ProtoMarshaler{},
+		metricsMarshaler: &pmetric.ProtoMarshaler{},
+		logsMarshaler:    &plog.ProtoMarshaler{},
+	}
+	// we ignore the error here as the config is already validated with the same method
+	receiver.ceCompression, _ = pCfg.parseCompression()
+	watermarkBehavior, _ := pCfg.Watermark.parseWatermarkBehavior()
+	switch watermarkBehavior {
+	case earliest:
+		receiver.tracesWatermarkFunc = earliestTracesWatermark
+		receiver.metricsWatermarkFunc = earliestMetricsWatermark
+		receiver.logsWatermarkFunc = earliestLogsWatermark
+	case current:
+		receiver.tracesWatermarkFunc = currentTracesWatermark
+		receiver.metricsWatermarkFunc = currentMetricsWatermark
+		receiver.logsWatermarkFunc = currentLogsWatermark
 	}
 	exporters[pCfg] = receiver
 	return receiver
 }
 
 // createDefaultConfig creates the default configuration for exporter.
-func createDefaultConfig() config.Exporter {
+func createDefaultConfig() component.Config {
 	return &Config{
-		ExporterSettings: config.NewExporterSettings(config.NewComponentID(typeStr)),
-		UserAgent:        "opentelemetry-collector-contrib {{version}}",
-		TimeoutSettings:  exporterhelper.TimeoutSettings{Timeout: defaultTimeout},
+		UserAgent:       "opentelemetry-collector-contrib {{version}}",
+		TimeoutSettings: exporterhelper.TimeoutConfig{Timeout: defaultTimeout},
+		Watermark: WatermarkConfig{
+			Behavior:     "current",
+			AllowedDrift: 0,
+		},
 	}
 }
 
 func createTracesExporter(
-	_ context.Context,
-	set component.ExporterCreateSettings,
-	cfg config.Exporter) (component.TracesExporter, error) {
-
+	ctx context.Context,
+	set exporter.Settings,
+	cfg component.Config,
+) (exporter.Traces, error) {
 	pCfg := cfg.(*Config)
 	pubsubExporter := ensureExporter(set, pCfg)
 
-	return exporterhelper.NewTracesExporter(
-		cfg,
+	return exporterhelper.NewTraces(
+		ctx,
 		set,
+		cfg,
 		pubsubExporter.consumeTraces,
+		exporterhelper.WithCapabilities(consumer.Capabilities{MutatesData: false}),
 		exporterhelper.WithTimeout(pCfg.TimeoutSettings),
-		exporterhelper.WithRetry(pCfg.RetrySettings),
+		exporterhelper.WithRetry(pCfg.BackOffConfig),
 		exporterhelper.WithQueue(pCfg.QueueSettings),
 		exporterhelper.WithStart(pubsubExporter.start),
 		exporterhelper.WithShutdown(pubsubExporter.shutdown),
@@ -89,19 +104,20 @@ func createTracesExporter(
 }
 
 func createMetricsExporter(
-	_ context.Context,
-	set component.ExporterCreateSettings,
-	cfg config.Exporter) (component.MetricsExporter, error) {
-
+	ctx context.Context,
+	set exporter.Settings,
+	cfg component.Config,
+) (exporter.Metrics, error) {
 	pCfg := cfg.(*Config)
 	pubsubExporter := ensureExporter(set, pCfg)
-
-	return exporterhelper.NewMetricsExporter(
-		cfg,
+	return exporterhelper.NewMetrics(
+		ctx,
 		set,
+		cfg,
 		pubsubExporter.consumeMetrics,
+		exporterhelper.WithCapabilities(consumer.Capabilities{MutatesData: false}),
 		exporterhelper.WithTimeout(pCfg.TimeoutSettings),
-		exporterhelper.WithRetry(pCfg.RetrySettings),
+		exporterhelper.WithRetry(pCfg.BackOffConfig),
 		exporterhelper.WithQueue(pCfg.QueueSettings),
 		exporterhelper.WithStart(pubsubExporter.start),
 		exporterhelper.WithShutdown(pubsubExporter.shutdown),
@@ -109,19 +125,21 @@ func createMetricsExporter(
 }
 
 func createLogsExporter(
-	_ context.Context,
-	set component.ExporterCreateSettings,
-	cfg config.Exporter) (component.LogsExporter, error) {
-
+	ctx context.Context,
+	set exporter.Settings,
+	cfg component.Config,
+) (exporter.Logs, error) {
 	pCfg := cfg.(*Config)
 	pubsubExporter := ensureExporter(set, pCfg)
 
-	return exporterhelper.NewLogsExporter(
-		cfg,
+	return exporterhelper.NewLogs(
+		ctx,
 		set,
+		cfg,
 		pubsubExporter.consumeLogs,
+		exporterhelper.WithCapabilities(consumer.Capabilities{MutatesData: false}),
 		exporterhelper.WithTimeout(pCfg.TimeoutSettings),
-		exporterhelper.WithRetry(pCfg.RetrySettings),
+		exporterhelper.WithRetry(pCfg.BackOffConfig),
 		exporterhelper.WithQueue(pCfg.QueueSettings),
 		exporterhelper.WithStart(pubsubExporter.start),
 		exporterhelper.WithShutdown(pubsubExporter.shutdown),

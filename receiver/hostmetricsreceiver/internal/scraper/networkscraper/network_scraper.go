@@ -1,16 +1,5 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//       http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
 package networkscraper // import "github.com/open-telemetry/opentelemetry-collector-contrib/receiver/hostmetricsreceiver/internal/scraper/networkscraper"
 
@@ -19,13 +8,15 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/shirou/gopsutil/v3/host"
-	"github.com/shirou/gopsutil/v3/net"
+	"github.com/shirou/gopsutil/v4/host"
+	"github.com/shirou/gopsutil/v4/net"
 	"go.opentelemetry.io/collector/component"
-	"go.opentelemetry.io/collector/model/pdata"
-	"go.opentelemetry.io/collector/receiver/scrapererror"
+	"go.opentelemetry.io/collector/pdata/pcommon"
+	"go.opentelemetry.io/collector/pdata/pmetric"
+	"go.opentelemetry.io/collector/receiver"
+	"go.opentelemetry.io/collector/scraper/scrapererror"
 
-	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/coreinternal/processor/filterset"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/filter/filterset"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/hostmetricsreceiver/internal/scraper/networkscraper/internal/metadata"
 )
 
@@ -35,22 +26,31 @@ const (
 )
 
 // scraper for Network Metrics
-type scraper struct {
+type networkScraper struct {
+	settings  receiver.Settings
 	config    *Config
 	mb        *metadata.MetricsBuilder
-	startTime pdata.Timestamp
+	startTime pcommon.Timestamp
 	includeFS filterset.FilterSet
 	excludeFS filterset.FilterSet
 
 	// for mocking
-	bootTime    func() (uint64, error)
-	ioCounters  func(bool) ([]net.IOCountersStat, error)
-	connections func(string) ([]net.ConnectionStat, error)
+	bootTime    func(context.Context) (uint64, error)
+	ioCounters  func(context.Context, bool) ([]net.IOCountersStat, error)
+	connections func(context.Context, string) ([]net.ConnectionStat, error)
+	conntrack   func(context.Context) ([]net.FilterStat, error)
 }
 
 // newNetworkScraper creates a set of Network related metrics
-func newNetworkScraper(_ context.Context, cfg *Config) (*scraper, error) {
-	scraper := &scraper{config: cfg, bootTime: host.BootTime, ioCounters: net.IOCounters, connections: net.Connections}
+func newNetworkScraper(_ context.Context, settings receiver.Settings, cfg *Config) (*networkScraper, error) {
+	scraper := &networkScraper{
+		settings:    settings,
+		config:      cfg,
+		bootTime:    host.BootTimeWithContext,
+		ioCounters:  net.IOCountersWithContext,
+		connections: net.ConnectionsWithContext,
+		conntrack:   net.FilterCountersWithContext,
+	}
 
 	var err error
 
@@ -71,51 +71,51 @@ func newNetworkScraper(_ context.Context, cfg *Config) (*scraper, error) {
 	return scraper, nil
 }
 
-func (s *scraper) start(context.Context, component.Host) error {
-	bootTime, err := s.bootTime()
+func (s *networkScraper) start(ctx context.Context, _ component.Host) error {
+	bootTime, err := s.bootTime(ctx)
 	if err != nil {
 		return err
 	}
 
-	s.startTime = pdata.Timestamp(bootTime * 1e9)
-	s.mb = metadata.NewMetricsBuilder(s.config.Metrics, metadata.WithStartTime(pdata.Timestamp(bootTime*1e9)))
+	s.startTime = pcommon.Timestamp(bootTime * 1e9)
+	s.mb = metadata.NewMetricsBuilder(s.config.MetricsBuilderConfig, s.settings, metadata.WithStartTime(pcommon.Timestamp(bootTime*1e9)))
 	return nil
 }
 
-func (s *scraper) scrape(_ context.Context) (pdata.Metrics, error) {
-	md := pdata.NewMetrics()
-	metrics := md.ResourceMetrics().AppendEmpty().InstrumentationLibraryMetrics().AppendEmpty().Metrics()
+func (s *networkScraper) scrape(ctx context.Context) (pmetric.Metrics, error) {
 	var errors scrapererror.ScrapeErrors
 
-	err := s.recordNetworkCounterMetrics(metrics)
+	err := s.recordNetworkCounterMetrics(ctx)
 	if err != nil {
 		errors.AddPartial(networkMetricsLen, err)
 	}
 
-	err = s.recordNetworkConnectionsMetrics(metrics)
+	err = s.recordNetworkConnectionsMetrics(ctx)
 	if err != nil {
 		errors.AddPartial(connectionsMetricsLen, err)
 	}
-	s.mb.Emit(metrics)
-	return md, errors.Combine()
+
+	err = s.recordNetworkConntrackMetrics(ctx)
+	if err != nil {
+		errors.AddPartial(connectionsMetricsLen, err)
+	}
+
+	return s.mb.Emit(), errors.Combine()
 }
 
-func (s *scraper) recordNetworkCounterMetrics(metrics pdata.MetricSlice) error {
-	now := pdata.NewTimestampFromTime(time.Now())
+func (s *networkScraper) recordNetworkCounterMetrics(ctx context.Context) error {
+	now := pcommon.NewTimestampFromTime(time.Now())
 
 	// get total stats only
-	ioCounters, err := s.ioCounters( /*perNetworkInterfaceController=*/ true)
+	ioCounters, err := s.ioCounters(ctx, true /*perNetworkInterfaceController=*/)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to read network IO stats: %w", err)
 	}
 
 	// filter network interfaces by name
 	ioCounters = s.filterByInterface(ioCounters)
 
 	if len(ioCounters) > 0 {
-		startIdx := metrics.Len()
-		metrics.EnsureCapacity(startIdx + networkMetricsLen)
-
 		s.recordNetworkPacketsMetric(now, ioCounters)
 		s.recordNetworkDroppedPacketsMetric(now, ioCounters)
 		s.recordNetworkErrorPacketsMetric(now, ioCounters)
@@ -125,46 +125,48 @@ func (s *scraper) recordNetworkCounterMetrics(metrics pdata.MetricSlice) error {
 	return nil
 }
 
-func (s *scraper) recordNetworkPacketsMetric(now pdata.Timestamp, ioCountersSlice []net.IOCountersStat) {
+func (s *networkScraper) recordNetworkPacketsMetric(now pcommon.Timestamp, ioCountersSlice []net.IOCountersStat) {
 	for _, ioCounters := range ioCountersSlice {
-		s.mb.RecordSystemNetworkPacketsDataPoint(now, int64(ioCounters.PacketsSent), ioCounters.Name, metadata.AttributeDirection.Transmit)
-		s.mb.RecordSystemNetworkPacketsDataPoint(now, int64(ioCounters.PacketsRecv), ioCounters.Name, metadata.AttributeDirection.Receive)
+		s.mb.RecordSystemNetworkPacketsDataPoint(now, int64(ioCounters.PacketsSent), ioCounters.Name, metadata.AttributeDirectionTransmit)
+		s.mb.RecordSystemNetworkPacketsDataPoint(now, int64(ioCounters.PacketsRecv), ioCounters.Name, metadata.AttributeDirectionReceive)
 	}
 }
 
-func (s *scraper) recordNetworkDroppedPacketsMetric(now pdata.Timestamp, ioCountersSlice []net.IOCountersStat) {
+func (s *networkScraper) recordNetworkDroppedPacketsMetric(now pcommon.Timestamp, ioCountersSlice []net.IOCountersStat) {
 	for _, ioCounters := range ioCountersSlice {
-		s.mb.RecordSystemNetworkDroppedDataPoint(now, int64(ioCounters.Dropout), ioCounters.Name, metadata.AttributeDirection.Transmit)
-		s.mb.RecordSystemNetworkDroppedDataPoint(now, int64(ioCounters.Dropin), ioCounters.Name, metadata.AttributeDirection.Receive)
+		s.mb.RecordSystemNetworkDroppedDataPoint(now, int64(ioCounters.Dropout), ioCounters.Name, metadata.AttributeDirectionTransmit)
+		s.mb.RecordSystemNetworkDroppedDataPoint(now, int64(ioCounters.Dropin), ioCounters.Name, metadata.AttributeDirectionReceive)
 	}
 }
 
-func (s *scraper) recordNetworkErrorPacketsMetric(now pdata.Timestamp, ioCountersSlice []net.IOCountersStat) {
+func (s *networkScraper) recordNetworkErrorPacketsMetric(now pcommon.Timestamp, ioCountersSlice []net.IOCountersStat) {
 	for _, ioCounters := range ioCountersSlice {
-		s.mb.RecordSystemNetworkErrorsDataPoint(now, int64(ioCounters.Errout), ioCounters.Name, metadata.AttributeDirection.Transmit)
-		s.mb.RecordSystemNetworkErrorsDataPoint(now, int64(ioCounters.Errin), ioCounters.Name, metadata.AttributeDirection.Receive)
+		s.mb.RecordSystemNetworkErrorsDataPoint(now, int64(ioCounters.Errout), ioCounters.Name, metadata.AttributeDirectionTransmit)
+		s.mb.RecordSystemNetworkErrorsDataPoint(now, int64(ioCounters.Errin), ioCounters.Name, metadata.AttributeDirectionReceive)
 	}
 }
 
-func (s *scraper) recordNetworkIOMetric(now pdata.Timestamp, ioCountersSlice []net.IOCountersStat) {
+func (s *networkScraper) recordNetworkIOMetric(now pcommon.Timestamp, ioCountersSlice []net.IOCountersStat) {
 	for _, ioCounters := range ioCountersSlice {
-		s.mb.RecordSystemNetworkIoDataPoint(now, int64(ioCounters.BytesSent), ioCounters.Name, metadata.AttributeDirection.Transmit)
-		s.mb.RecordSystemNetworkIoDataPoint(now, int64(ioCounters.BytesRecv), ioCounters.Name, metadata.AttributeDirection.Receive)
+		s.mb.RecordSystemNetworkIoDataPoint(now, int64(ioCounters.BytesSent), ioCounters.Name, metadata.AttributeDirectionTransmit)
+		s.mb.RecordSystemNetworkIoDataPoint(now, int64(ioCounters.BytesRecv), ioCounters.Name, metadata.AttributeDirectionReceive)
 	}
 }
 
-func (s *scraper) recordNetworkConnectionsMetrics(metrics pdata.MetricSlice) error {
-	now := pdata.NewTimestampFromTime(time.Now())
+func (s *networkScraper) recordNetworkConnectionsMetrics(ctx context.Context) error {
+	if !s.config.Metrics.SystemNetworkConnections.Enabled {
+		return nil
+	}
 
-	connections, err := s.connections("tcp")
+	now := pcommon.NewTimestampFromTime(time.Now())
+
+	connections, err := s.connections(ctx, "tcp")
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to read TCP connections: %w", err)
 	}
 
 	tcpConnectionStatusCounts := getTCPConnectionStatusCounts(connections)
 
-	startIdx := metrics.Len()
-	metrics.EnsureCapacity(startIdx + connectionsMetricsLen)
 	s.recordNetworkConnectionsMetric(now, tcpConnectionStatusCounts)
 	return nil
 }
@@ -181,13 +183,13 @@ func getTCPConnectionStatusCounts(connections []net.ConnectionStat) map[string]i
 	return tcpStatuses
 }
 
-func (s *scraper) recordNetworkConnectionsMetric(now pdata.Timestamp, connectionStateCounts map[string]int64) {
+func (s *networkScraper) recordNetworkConnectionsMetric(now pcommon.Timestamp, connectionStateCounts map[string]int64) {
 	for connectionState, count := range connectionStateCounts {
-		s.mb.RecordSystemNetworkConnectionsDataPoint(now, count, metadata.AttributeProtocol.Tcp, connectionState)
+		s.mb.RecordSystemNetworkConnectionsDataPoint(now, count, metadata.AttributeProtocolTcp, connectionState)
 	}
 }
 
-func (s *scraper) filterByInterface(ioCounters []net.IOCountersStat) []net.IOCountersStat {
+func (s *networkScraper) filterByInterface(ioCounters []net.IOCountersStat) []net.IOCountersStat {
 	if s.includeFS == nil && s.excludeFS == nil {
 		return ioCounters
 	}
@@ -201,7 +203,7 @@ func (s *scraper) filterByInterface(ioCounters []net.IOCountersStat) []net.IOCou
 	return filteredIOCounters
 }
 
-func (s *scraper) includeInterface(interfaceName string) bool {
+func (s *networkScraper) includeInterface(interfaceName string) bool {
 	return (s.includeFS == nil || s.includeFS.Matches(interfaceName)) &&
 		(s.excludeFS == nil || !s.excludeFS.Matches(interfaceName))
 }

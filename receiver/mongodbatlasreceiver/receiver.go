@@ -1,38 +1,32 @@
-// Copyright  OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
 
 package mongodbatlasreceiver // import "github.com/open-telemetry/opentelemetry-collector-contrib/receiver/mongodbatlasreceiver"
 
 import (
 	"context"
+	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
-	"github.com/pkg/errors"
 	"go.mongodb.org/atlas/mongodbatlas"
-	"go.opentelemetry.io/collector/model/pdata"
-	"go.opentelemetry.io/collector/receiver/scraperhelper"
+	"go.opentelemetry.io/collector/pdata/pmetric"
+	"go.opentelemetry.io/collector/receiver"
+	"go.opentelemetry.io/collector/scraper"
 	"go.uber.org/zap"
 
 	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/mongodbatlasreceiver/internal"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/mongodbatlasreceiver/internal/metadata"
 )
 
-type receiver struct {
-	log     *zap.Logger
-	cfg     *Config
-	client  *internal.MongoDBAtlasClient
-	lastRun time.Time
+type mongodbatlasreceiver struct {
+	log         *zap.Logger
+	cfg         *Config
+	client      *internal.MongoDBAtlasClient
+	lastRun     time.Time
+	mb          *metadata.MetricsBuilder
+	stopperChan chan struct{}
 }
 
 type timeconstraints struct {
@@ -41,139 +35,241 @@ type timeconstraints struct {
 	resolution string
 }
 
-func newMongoDBAtlasScraper(log *zap.Logger, cfg *Config) (scraperhelper.Scraper, error) {
-	client, err := internal.NewMongoDBAtlasClient(cfg.PublicKey, cfg.PrivateKey, cfg.RetrySettings, log)
-	if err != nil {
-		return nil, err
+func newMongoDBAtlasReceiver(settings receiver.Settings, cfg *Config) *mongodbatlasreceiver {
+	client := internal.NewMongoDBAtlasClient(cfg.PublicKey, string(cfg.PrivateKey), cfg.BackOffConfig, settings.Logger)
+	for _, p := range cfg.Projects {
+		p.populateIncludesAndExcludes()
 	}
-	recv := &receiver{log: log, cfg: cfg, client: client}
-	return scraperhelper.NewScraper(typeStr, recv.scrape, scraperhelper.WithShutdown(recv.shutdown))
+
+	return &mongodbatlasreceiver{
+		log:         settings.Logger,
+		cfg:         cfg,
+		client:      client,
+		mb:          metadata.NewMetricsBuilder(cfg.MetricsBuilderConfig, settings),
+		stopperChan: make(chan struct{}),
+	}
 }
 
-func (s *receiver) scrape(ctx context.Context) (pdata.Metrics, error) {
+func newMongoDBAtlasScraper(recv *mongodbatlasreceiver) (scraper.Metrics, error) {
+	return scraper.NewMetrics(recv.scrape, scraper.WithShutdown(recv.shutdown))
+}
+
+func (s *mongodbatlasreceiver) scrape(ctx context.Context) (pmetric.Metrics, error) {
+	now := time.Now()
+	if err := s.poll(ctx, s.timeConstraints(now)); err != nil {
+		return pmetric.Metrics{}, err
+	}
+	s.lastRun = now
+	return s.mb.Emit(), nil
+}
+
+func (s *mongodbatlasreceiver) timeConstraints(now time.Time) timeconstraints {
 	var start time.Time
 	if s.lastRun.IsZero() {
-		start = s.lastRun
+		start = now.Add(s.cfg.CollectionInterval * -1)
 	} else {
-		start = time.Now().Add(s.cfg.CollectionInterval * -1)
+		start = s.lastRun
 	}
-	now := time.Now()
-	timeConstraints := timeconstraints{
+	return timeconstraints{
 		start.UTC().Format(time.RFC3339),
 		now.UTC().Format(time.RFC3339),
 		s.cfg.Granularity,
 	}
-	metrics, err := s.poll(ctx, timeConstraints)
-	if err != nil {
-		return pdata.Metrics{}, err
-	}
-	s.lastRun = now
-	return metrics, nil
 }
 
-func (s *receiver) shutdown(context.Context) error {
+func (s *mongodbatlasreceiver) shutdown(context.Context) error {
 	return s.client.Shutdown()
 }
 
-func (s *receiver) poll(ctx context.Context, time timeconstraints) (pdata.Metrics, error) {
-	resourceAttributes := pdata.NewAttributeMap()
-	allMetrics := pdata.NewMetrics()
+// poll decides whether to poll all projects or a specific project based on the configuration.
+func (s *mongodbatlasreceiver) poll(ctx context.Context, time timeconstraints) error {
+	if len(s.cfg.Projects) == 0 {
+		return s.pollAllProjects(ctx, time)
+	}
+	return s.pollProjects(ctx, time)
+}
+
+// pollAllProjects handles polling across all projects within the organizations.
+func (s *mongodbatlasreceiver) pollAllProjects(ctx context.Context, time timeconstraints) error {
 	orgs, err := s.client.Organizations(ctx)
 	if err != nil {
-		return pdata.Metrics{}, errors.Wrap(err, "error retrieving organizations")
+		return fmt.Errorf("error retrieving organizations: %w", err)
 	}
 	for _, org := range orgs {
-		resourceAttributes.InsertString("mongodb.atlas.org_name", org.Name)
-		projects, err := s.client.Projects(ctx, org.ID)
+		proj, err := s.client.Projects(ctx, org.ID)
 		if err != nil {
-			return pdata.Metrics{}, errors.Wrap(err, "error retrieving projects")
+			s.log.Error("error retrieving projects", zap.String("orgID", org.ID), zap.Error(err))
+			continue
 		}
-		for _, project := range projects {
-			resourceAttributes.InsertString("mongodb.atlas.project", project.Name)
-			processes, err := s.client.Processes(ctx, project.ID)
-			if err != nil {
-				return pdata.Metrics{}, errors.Wrap(err, "error retrieving MongoDB Atlas processes")
-			}
-			for _, process := range processes {
-				resource := pdata.NewResource()
-				resourceAttributes.CopyTo(resource.Attributes())
-				resource.Attributes().InsertString("host.name", process.Hostname)
-				resource.Attributes().InsertString("process.port", strconv.Itoa(process.Port))
-				resourceMetrics, err := s.extractProcessMetrics(
-					ctx,
-					time,
-					project,
-					process,
-					resource,
-				)
-				if err != nil {
-					return pdata.Metrics{}, err
-				}
-				resourceMetrics.MoveAndAppendTo(allMetrics.ResourceMetrics())
+		for _, project := range proj {
+			// Since there is no specific ProjectConfig for these projects, pass nil.
+			if err := s.processProject(ctx, time, org.Name, project, nil); err != nil {
+				s.log.Error("error processing project", zap.String("projectID", project.ID), zap.Error(err))
 			}
 		}
 	}
-	return allMetrics, nil
+	return nil
 }
 
-func (s *receiver) extractProcessMetrics(
-	ctx context.Context,
-	time timeconstraints,
-	project *mongodbatlas.Project,
-	process *mongodbatlas.Process,
-	resource pdata.Resource,
-) (pdata.ResourceMetricsSlice, error) {
-	processMetrics := pdata.NewResourceMetricsSlice()
-	// This receiver will support both logs and metrics- if one pipeline
-	//  or the other is not configured, it will be nil.
-	metrics, err :=
-		s.client.ProcessMetrics(
-			ctx,
-			resource,
-			project.ID,
-			process.Hostname,
-			process.Port,
-			time.start,
-			time.end,
-			time.resolution,
-		)
-	if err != nil {
-		return pdata.ResourceMetricsSlice{}, errors.Wrap(
-			err,
-			"error when polling process metrics from MongoDB Atlas",
-		)
-	}
-	metrics.ResourceMetrics().MoveAndAppendTo(processMetrics)
+// pollProject handles polling for specific projects as configured.
+func (s *mongodbatlasreceiver) pollProjects(ctx context.Context, time timeconstraints) error {
+	for _, projectCfg := range s.cfg.Projects {
+		project, err := s.client.GetProject(ctx, projectCfg.Name)
+		if err != nil {
+			s.log.Error("error retrieving project", zap.String("projectName", projectCfg.Name), zap.Error(err))
+			continue
+		}
 
-	databaseMetrics, err := s.extractProcessDatabaseMetrics(ctx, time, project, process, resource)
-	if err != nil {
-		return pdata.ResourceMetricsSlice{}, errors.Wrap(
-			err,
-			"error when polling process database metrics from MongoDB Atlas",
-		)
-	}
-	databaseMetrics.MoveAndAppendTo(processMetrics)
+		org, err := s.client.GetOrganization(ctx, project.OrgID)
+		if err != nil {
+			s.log.Error("error retrieving organization from project", zap.String("projectName", projectCfg.Name), zap.Error(err))
+			continue
+		}
 
-	diskMetrics, err := s.extractProcessDiskMetrics(ctx, time, project, process, resource)
-	if err != nil {
-		return pdata.ResourceMetricsSlice{}, errors.Wrap(
-			err,
-			"error when polling process disk metrics from MongoDB Atlas",
-		)
+		if err := s.processProject(ctx, time, org.Name, project, projectCfg); err != nil {
+			s.log.Error("error processing project", zap.String("projectID", project.ID), zap.Error(err))
+		}
 	}
-	diskMetrics.MoveAndAppendTo(processMetrics)
-
-	return processMetrics, nil
+	return nil
 }
 
-func (s *receiver) extractProcessDatabaseMetrics(
+func (s *mongodbatlasreceiver) processProject(ctx context.Context, time timeconstraints, orgName string, project *mongodbatlas.Project, projectCfg *ProjectConfig) error {
+	nodeClusterMap, providerMap, err := s.getNodeClusterNameMap(ctx, project.ID)
+	if err != nil {
+		return fmt.Errorf("error collecting clusters from project %s: %w", project.ID, err)
+	}
+
+	processes, err := s.client.Processes(ctx, project.ID)
+	if err != nil {
+		return fmt.Errorf("error retrieving MongoDB Atlas processes for project %s: %w", project.ID, err)
+	}
+
+	for _, process := range processes {
+		clusterName := nodeClusterMap[process.UserAlias]
+		providerValues := providerMap[clusterName]
+
+		if !shouldProcessCluster(projectCfg, clusterName) {
+			// Skip processing for this cluster
+			continue
+		}
+
+		if err := s.extractProcessMetrics(ctx, time, orgName, project, process, clusterName, providerValues); err != nil {
+			return fmt.Errorf("error when polling process metrics from MongoDB Atlas for process %s: %w", process.ID, err)
+		}
+
+		if err := s.extractProcessDatabaseMetrics(ctx, time, orgName, project, process, clusterName, providerValues); err != nil {
+			return fmt.Errorf("error when polling process database metrics from MongoDB Atlas for process %s: %w", process.ID, err)
+		}
+
+		if err := s.extractProcessDiskMetrics(ctx, time, orgName, project, process, clusterName, providerValues); err != nil {
+			return fmt.Errorf("error when polling process disk metrics from MongoDB Atlas for process %s: %w", process.ID, err)
+		}
+	}
+
+	return nil
+}
+
+// shouldProcessCluster checks whether a given cluster should be processed based on the project configuration.
+func shouldProcessCluster(projectCfg *ProjectConfig, clusterName string) bool {
+	if projectCfg == nil {
+		// If there is no project config, process all clusters.
+		return true
+	}
+
+	_, isIncluded := projectCfg.includesByClusterName[clusterName]
+	_, isExcluded := projectCfg.excludesByClusterName[clusterName]
+
+	// Return false immediately if the cluster is excluded.
+	if isExcluded {
+		return false
+	}
+
+	// If IncludeClusters is empty, or the cluster is explicitly included, return true.
+	return len(projectCfg.IncludeClusters) == 0 || isIncluded
+}
+
+type providerValues struct {
+	RegionName   string
+	ProviderName string
+}
+
+func (s *mongodbatlasreceiver) getNodeClusterNameMap(
+	ctx context.Context,
+	projectID string,
+) (map[string]string, map[string]providerValues, error) {
+	providerMap := make(map[string]providerValues)
+	clusterMap := make(map[string]string)
+	clusters, err := s.client.GetClusters(ctx, projectID)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	for _, cluster := range clusters {
+		// URI in the form mongodb://host1.mongodb.net:27017,host2.mongodb.net:27017,host3.mongodb.net:27017
+		nodes := strings.Split(strings.TrimPrefix(cluster.MongoURI, "mongodb://"), ",")
+		for _, node := range nodes {
+			// Remove the port from the node
+			n, _, _ := strings.Cut(node, ":")
+			clusterMap[n] = cluster.Name
+		}
+
+		providerMap[cluster.Name] = providerValues{
+			RegionName:   cluster.ProviderSettings.RegionName,
+			ProviderName: cluster.ProviderSettings.ProviderName,
+		}
+	}
+
+	return clusterMap, providerMap, nil
+}
+
+func (s *mongodbatlasreceiver) extractProcessMetrics(
 	ctx context.Context,
 	time timeconstraints,
+	orgName string,
 	project *mongodbatlas.Project,
 	process *mongodbatlas.Process,
-	resource pdata.Resource,
-) (pdata.ResourceMetricsSlice, error) {
-	pdMetrics := pdata.NewResourceMetricsSlice()
+	clusterName string,
+	providerValues providerValues,
+) error {
+	if err := s.client.ProcessMetrics(
+		ctx,
+		s.mb,
+		project.ID,
+		process.Hostname,
+		process.Port,
+		time.start,
+		time.end,
+		time.resolution,
+	); err != nil {
+		return fmt.Errorf("error when polling process metrics from MongoDB Atlas: %w", err)
+	}
+
+	rb := s.mb.NewResourceBuilder()
+	rb.SetMongodbAtlasOrgName(orgName)
+	rb.SetMongodbAtlasProjectName(project.Name)
+	rb.SetMongodbAtlasProjectID(project.ID)
+	rb.SetMongodbAtlasHostName(process.Hostname)
+	rb.SetMongodbAtlasUserAlias(process.UserAlias)
+	rb.SetMongodbAtlasClusterName(clusterName)
+	rb.SetMongodbAtlasProcessPort(strconv.Itoa(process.Port))
+	rb.SetMongodbAtlasProcessTypeName(process.TypeName)
+	rb.SetMongodbAtlasProcessID(process.ID)
+	rb.SetMongodbAtlasRegionName(providerValues.RegionName)
+	rb.SetMongodbAtlasProviderName(providerValues.ProviderName)
+	s.mb.EmitForResource(metadata.WithResource(rb.Emit()))
+
+	return nil
+}
+
+func (s *mongodbatlasreceiver) extractProcessDatabaseMetrics(
+	ctx context.Context,
+	time timeconstraints,
+	orgName string,
+	project *mongodbatlas.Project,
+	process *mongodbatlas.Process,
+	clusterName string,
+	providerValues providerValues,
+) error {
 	processDatabases, err := s.client.ProcessDatabases(
 		ctx,
 		project.ID,
@@ -181,17 +277,13 @@ func (s *receiver) extractProcessDatabaseMetrics(
 		process.Port,
 	)
 	if err != nil {
-		return pdata.ResourceMetricsSlice{}, errors.Wrap(err, "error retrieving process databases")
+		return fmt.Errorf("error retrieving process databases: %w", err)
 	}
 
 	for _, db := range processDatabases {
-		dbResource := pdata.NewResource()
-		resource.CopyTo(dbResource)
-		resource.Attributes().
-			InsertString("mongodb.atlas.database_name", db.DatabaseName)
-		metrics, err := s.client.ProcessDatabaseMetrics(
+		if err := s.client.ProcessDatabaseMetrics(
 			ctx,
-			resource,
+			s.mb,
 			project.ID,
 			process.Hostname,
 			process.Port,
@@ -199,34 +291,40 @@ func (s *receiver) extractProcessDatabaseMetrics(
 			time.start,
 			time.end,
 			time.resolution,
-		)
-		if err != nil {
-			return pdata.ResourceMetricsSlice{}, errors.Wrap(
-				err,
-				"error when polling database metrics from MongoDB Atlas",
-			)
+		); err != nil {
+			return fmt.Errorf("error when polling database metrics from MongoDB Atlas: %w", err)
 		}
-		metrics.ResourceMetrics().MoveAndAppendTo(pdMetrics)
+		rb := s.mb.NewResourceBuilder()
+		rb.SetMongodbAtlasOrgName(orgName)
+		rb.SetMongodbAtlasProjectName(project.Name)
+		rb.SetMongodbAtlasProjectID(project.ID)
+		rb.SetMongodbAtlasHostName(process.Hostname)
+		rb.SetMongodbAtlasUserAlias(process.UserAlias)
+		rb.SetMongodbAtlasClusterName(clusterName)
+		rb.SetMongodbAtlasProcessPort(strconv.Itoa(process.Port))
+		rb.SetMongodbAtlasProcessTypeName(process.TypeName)
+		rb.SetMongodbAtlasProcessID(process.ID)
+		rb.SetMongodbAtlasDbName(db.DatabaseName)
+		rb.SetMongodbAtlasRegionName(providerValues.RegionName)
+		rb.SetMongodbAtlasProviderName(providerValues.ProviderName)
+		s.mb.EmitForResource(metadata.WithResource(rb.Emit()))
 	}
-	return pdMetrics, nil
+	return nil
 }
 
-func (s *receiver) extractProcessDiskMetrics(
+func (s *mongodbatlasreceiver) extractProcessDiskMetrics(
 	ctx context.Context,
 	time timeconstraints,
+	orgName string,
 	project *mongodbatlas.Project,
 	process *mongodbatlas.Process,
-	resource pdata.Resource,
-) (pdata.ResourceMetricsSlice, error) {
-	pdMetrics := pdata.NewResourceMetricsSlice()
+	clusterName string,
+	providerValues providerValues,
+) error {
 	for _, disk := range s.client.ProcessDisks(ctx, project.ID, process.Hostname, process.Port) {
-		diskResource := pdata.NewResource()
-		resource.CopyTo(diskResource)
-		diskResource.Attributes().
-			InsertString("mongodb.atlas.partition", disk.PartitionName)
-		metrics, err := s.client.ProcessDiskMetrics(
+		if err := s.client.ProcessDiskMetrics(
 			ctx,
-			diskResource,
+			s.mb,
 			project.ID,
 			process.Hostname,
 			process.Port,
@@ -234,14 +332,23 @@ func (s *receiver) extractProcessDiskMetrics(
 			time.start,
 			time.end,
 			time.resolution,
-		)
-		if err != nil {
-			return pdata.ResourceMetricsSlice{}, errors.Wrap(
-				err,
-				"error when polling from MongoDB Atlas",
-			)
+		); err != nil {
+			return fmt.Errorf("error when polling disk metrics from MongoDB Atlas: %w", err)
 		}
-		metrics.ResourceMetrics().MoveAndAppendTo(pdMetrics)
+		rb := s.mb.NewResourceBuilder()
+		rb.SetMongodbAtlasOrgName(orgName)
+		rb.SetMongodbAtlasProjectName(project.Name)
+		rb.SetMongodbAtlasProjectID(project.ID)
+		rb.SetMongodbAtlasHostName(process.Hostname)
+		rb.SetMongodbAtlasUserAlias(process.UserAlias)
+		rb.SetMongodbAtlasClusterName(clusterName)
+		rb.SetMongodbAtlasProcessPort(strconv.Itoa(process.Port))
+		rb.SetMongodbAtlasProcessTypeName(process.TypeName)
+		rb.SetMongodbAtlasProcessID(process.ID)
+		rb.SetMongodbAtlasDiskPartition(disk.PartitionName)
+		rb.SetMongodbAtlasRegionName(providerValues.RegionName)
+		rb.SetMongodbAtlasProviderName(providerValues.ProviderName)
+		s.mb.EmitForResource(metadata.WithResource(rb.Emit()))
 	}
-	return pdMetrics, nil
+	return nil
 }

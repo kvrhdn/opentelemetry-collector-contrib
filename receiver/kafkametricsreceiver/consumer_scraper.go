@@ -1,16 +1,5 @@
-// Copyright  OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
 
 package kafkametricsreceiver // import "github.com/open-telemetry/opentelemetry-collector-contrib/receiver/kafkametricsreceiver"
 
@@ -20,70 +9,72 @@ import (
 	"regexp"
 	"time"
 
-	"github.com/Shopify/sarama"
+	"github.com/IBM/sarama"
 	"go.opentelemetry.io/collector/component"
-	"go.opentelemetry.io/collector/model/pdata"
-	"go.opentelemetry.io/collector/receiver/scraperhelper"
+	"go.opentelemetry.io/collector/pdata/pcommon"
+	"go.opentelemetry.io/collector/pdata/pmetric"
+	"go.opentelemetry.io/collector/receiver"
+	"go.opentelemetry.io/collector/scraper"
 	"go.uber.org/multierr"
-	"go.uber.org/zap"
 
 	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/kafkametricsreceiver/internal/metadata"
 )
 
 type consumerScraper struct {
 	client       sarama.Client
-	logger       *zap.Logger
+	settings     receiver.Settings
 	groupFilter  *regexp.Regexp
 	topicFilter  *regexp.Regexp
 	clusterAdmin sarama.ClusterAdmin
 	saramaConfig *sarama.Config
 	config       Config
+	mb           *metadata.MetricsBuilder
 }
 
-func (s *consumerScraper) Name() string {
-	return consumersScraperName
-}
-
-func (s *consumerScraper) start(context.Context, component.Host) error {
-	client, err := newSaramaClient(s.config.Brokers, s.saramaConfig)
-	if err != nil {
-		return fmt.Errorf("failed to create client while starting consumer scraper: %w", err)
-	}
-	clusterAdmin, err := newClusterAdmin(s.config.Brokers, s.saramaConfig)
-	if err != nil {
-		if client != nil {
-			_ = client.Close()
-		}
-		return fmt.Errorf("failed to create cluster admin while starting consumer scraper: %w", err)
-	}
-	s.client = client
-	s.clusterAdmin = clusterAdmin
+func (s *consumerScraper) start(_ context.Context, _ component.Host) error {
+	s.mb = metadata.NewMetricsBuilder(s.config.MetricsBuilderConfig, s.settings)
 	return nil
 }
 
 func (s *consumerScraper) shutdown(_ context.Context) error {
-	if !s.client.Closed() {
+	if s.client != nil && !s.client.Closed() {
 		return s.client.Close()
 	}
 	return nil
 }
 
-func (s *consumerScraper) scrape(context.Context) (pdata.Metrics, error) {
-	cgs, listErr := s.clusterAdmin.ListConsumerGroups()
-	if listErr != nil {
-		return pdata.Metrics{}, listErr
+func (s *consumerScraper) scrape(context.Context) (pmetric.Metrics, error) {
+	if s.client == nil {
+		client, err := newSaramaClient(s.config.Brokers, s.saramaConfig)
+		if err != nil {
+			return pmetric.Metrics{}, fmt.Errorf("failed to create client in consumer scraper: %w", err)
+		}
+		clusterAdmin, err := newClusterAdmin(s.config.Brokers, s.saramaConfig)
+		if err != nil {
+			if client != nil {
+				_ = client.Close()
+			}
+			return pmetric.Metrics{}, fmt.Errorf("failed to create cluster admin in consumer scraper: %w", err)
+		}
+		s.client = client
+		s.clusterAdmin = clusterAdmin
 	}
 
-	var matchedGrpIds []string
+	cgs, listErr := s.clusterAdmin.ListConsumerGroups()
+	if listErr != nil {
+		return pmetric.Metrics{}, listErr
+	}
+
+	var matchedGrpIDs []string
 	for grpID := range cgs {
 		if s.groupFilter.MatchString(grpID) {
-			matchedGrpIds = append(matchedGrpIds, grpID)
+			matchedGrpIDs = append(matchedGrpIDs, grpID)
 		}
 	}
 
 	allTopics, listErr := s.clusterAdmin.ListTopics()
 	if listErr != nil {
-		return pdata.Metrics{}, listErr
+		return pmetric.Metrics{}, listErr
 	}
 
 	matchedTopics := map[string]sarama.TopicDetail{}
@@ -115,24 +106,22 @@ func (s *consumerScraper) scrape(context.Context) (pdata.Metrics, error) {
 			topicPartitionOffset[topic][p] = offset
 		}
 	}
-	consumerGroups, listErr := s.clusterAdmin.DescribeConsumerGroups(matchedGrpIds)
+	consumerGroups, listErr := s.clusterAdmin.DescribeConsumerGroups(matchedGrpIDs)
 	if listErr != nil {
-		return pdata.Metrics{}, listErr
+		return pmetric.Metrics{}, listErr
 	}
 
-	now := pdata.NewTimestampFromTime(time.Now())
-	md := pdata.NewMetrics()
-	ilm := md.ResourceMetrics().AppendEmpty().InstrumentationLibraryMetrics().AppendEmpty()
-	ilm.InstrumentationLibrary().SetName(instrumentationLibName)
+	now := pcommon.NewTimestampFromTime(time.Now())
+
 	for _, group := range consumerGroups {
-		labels := pdata.NewAttributeMap()
-		labels.UpsertString(metadata.A.Group, group.GroupId)
-		addIntGauge(ilm.Metrics(), metadata.M.KafkaConsumerGroupMembers.Name(), now, labels, int64(len(group.Members)))
+		s.mb.RecordKafkaConsumerGroupMembersDataPoint(now, int64(len(group.Members)), group.GroupId)
+
 		groupOffsetFetchResponse, err := s.clusterAdmin.ListConsumerGroupOffsets(group.GroupId, topicPartitions)
 		if err != nil {
 			scrapeError = multierr.Append(scrapeError, err)
 			continue
 		}
+
 		for topic, partitions := range groupOffsetFetchResponse.Blocks {
 			// tracking matchedTopics consumed by this group
 			// by checking if any of the blocks has an offset
@@ -143,15 +132,14 @@ func (s *consumerScraper) scrape(context.Context) (pdata.Metrics, error) {
 					break
 				}
 			}
-			labels.UpsertString(metadata.A.Topic, topic)
 			if isConsumed {
 				var lagSum int64
 				var offsetSum int64
 				for partition, block := range partitions {
-					labels.UpsertInt(metadata.A.Partition, int64(partition))
 					consumerOffset := block.Offset
 					offsetSum += consumerOffset
-					addIntGauge(ilm.Metrics(), metadata.M.KafkaConsumerGroupOffset.Name(), now, labels, consumerOffset)
+					s.mb.RecordKafkaConsumerGroupOffsetDataPoint(now, consumerOffset, group.GroupId, topic, int64(partition))
+
 					// default -1 to indicate no lag measured.
 					var consumerLag int64 = -1
 					if partitionOffset, ok := topicPartitionOffset[topic][partition]; ok {
@@ -161,19 +149,23 @@ func (s *consumerScraper) scrape(context.Context) (pdata.Metrics, error) {
 							lagSum += consumerLag
 						}
 					}
-					addIntGauge(ilm.Metrics(), metadata.M.KafkaConsumerGroupLag.Name(), now, labels, consumerLag)
+					s.mb.RecordKafkaConsumerGroupLagDataPoint(now, consumerLag, group.GroupId, topic, int64(partition))
 				}
-				labels.Delete(metadata.A.Partition)
-				addIntGauge(ilm.Metrics(), metadata.M.KafkaConsumerGroupOffsetSum.Name(), now, labels, offsetSum)
-				addIntGauge(ilm.Metrics(), metadata.M.KafkaConsumerGroupLagSum.Name(), now, labels, lagSum)
+				s.mb.RecordKafkaConsumerGroupOffsetSumDataPoint(now, offsetSum, group.GroupId, topic)
+				s.mb.RecordKafkaConsumerGroupLagSumDataPoint(now, lagSum, group.GroupId, topic)
 			}
 		}
 	}
 
-	return md, scrapeError
+	rb := s.mb.NewResourceBuilder()
+	rb.SetKafkaClusterAlias(s.config.ClusterAlias)
+
+	return s.mb.Emit(metadata.WithResource(rb.Emit())), scrapeError
 }
 
-func createConsumerScraper(_ context.Context, cfg Config, saramaConfig *sarama.Config, logger *zap.Logger) (scraperhelper.Scraper, error) {
+func createConsumerScraper(_ context.Context, cfg Config, saramaConfig *sarama.Config,
+	settings receiver.Settings,
+) (scraper.Metrics, error) {
 	groupFilter, err := regexp.Compile(cfg.GroupMatch)
 	if err != nil {
 		return nil, fmt.Errorf("failed to compile group_match: %w", err)
@@ -183,16 +175,15 @@ func createConsumerScraper(_ context.Context, cfg Config, saramaConfig *sarama.C
 		return nil, fmt.Errorf("failed to compile topic filter: %w", err)
 	}
 	s := consumerScraper{
-		logger:       logger,
+		settings:     settings,
 		groupFilter:  groupFilter,
 		topicFilter:  topicFilter,
 		config:       cfg,
 		saramaConfig: saramaConfig,
 	}
-	return scraperhelper.NewScraper(
-		s.Name(),
+	return scraper.NewMetrics(
 		s.scrape,
-		scraperhelper.WithShutdown(s.shutdown),
-		scraperhelper.WithStart(s.start),
+		scraper.WithStart(s.start),
+		scraper.WithShutdown(s.shutdown),
 	)
 }

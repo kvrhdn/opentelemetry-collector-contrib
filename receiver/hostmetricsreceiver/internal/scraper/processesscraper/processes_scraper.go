@@ -1,16 +1,5 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//       http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
 package processesscraper // import "github.com/open-telemetry/opentelemetry-collector-contrib/receiver/hostmetricsreceiver/internal/scraper/processesscraper"
 
@@ -18,12 +7,14 @@ import (
 	"context"
 	"time"
 
-	"github.com/shirou/gopsutil/v3/host"
-	"github.com/shirou/gopsutil/v3/load"
-	"github.com/shirou/gopsutil/v3/process"
+	"github.com/shirou/gopsutil/v4/host"
+	"github.com/shirou/gopsutil/v4/load"
+	"github.com/shirou/gopsutil/v4/process"
 	"go.opentelemetry.io/collector/component"
-	"go.opentelemetry.io/collector/model/pdata"
-	"go.opentelemetry.io/collector/receiver/scrapererror"
+	"go.opentelemetry.io/collector/pdata/pcommon"
+	"go.opentelemetry.io/collector/pdata/pmetric"
+	"go.opentelemetry.io/collector/receiver"
+	"go.opentelemetry.io/collector/scraper/scrapererror"
 
 	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/hostmetricsreceiver/internal/scraper/processesscraper/internal/metadata"
 )
@@ -40,13 +31,15 @@ var metricsLength = func() int {
 }()
 
 // scraper for Processes Metrics
-type scraper struct {
-	config    *Config
-	startTime pdata.Timestamp
+type processesScraper struct {
+	settings receiver.Settings
+	config   *Config
+	mb       *metadata.MetricsBuilder
 
 	// for mocking gopsutil
-	getMiscStats func() (*load.MiscStat, error)
-	getProcesses func() ([]proc, error)
+	getMiscStats func(context.Context) (*load.MiscStat, error)
+	getProcesses func(context.Context) ([]proc, error)
+	bootTime     func(context.Context) (uint64, error)
 }
 
 // for mocking out gopsutil process.Process
@@ -55,79 +48,59 @@ type proc interface {
 }
 
 type processesMetadata struct {
-	countByStatus    map[string]int64 // ignored if enableProcessesCount is false
-	processesCreated *int64           // ignored if enableProcessesCreated is false
+	countByStatus    map[metadata.AttributeStatus]int64 // ignored if enableProcessesCount is false
+	processesCreated *int64                             // ignored if enableProcessesCreated is false
 }
 
 // newProcessesScraper creates a set of Processes related metrics
-func newProcessesScraper(_ context.Context, cfg *Config) *scraper {
-	return &scraper{
+func newProcessesScraper(_ context.Context, settings receiver.Settings, cfg *Config) *processesScraper {
+	return &processesScraper{
+		settings:     settings,
 		config:       cfg,
-		getMiscStats: load.Misc,
-		getProcesses: func() ([]proc, error) {
-			ps, err := process.Processes()
+		getMiscStats: load.MiscWithContext,
+		getProcesses: func(ctx context.Context) ([]proc, error) {
+			ps, err := process.ProcessesWithContext(ctx)
 			ret := make([]proc, len(ps))
 			for i := range ps {
 				ret[i] = ps[i]
 			}
 			return ret, err
 		},
+		bootTime: host.BootTimeWithContext,
 	}
 }
 
-func (s *scraper) start(context.Context, component.Host) error {
-	bootTime, err := host.BootTime()
+func (s *processesScraper) start(ctx context.Context, _ component.Host) error {
+	bootTime, err := s.bootTime(ctx)
 	if err != nil {
 		return err
 	}
-	// bootTime is seconds since 1970, timestamps are in nanoseconds.
-	s.startTime = pdata.Timestamp(bootTime * 1e9)
+
+	s.mb = metadata.NewMetricsBuilder(s.config.MetricsBuilderConfig, s.settings, metadata.WithStartTime(pcommon.Timestamp(bootTime*1e9)))
 	return nil
 }
 
-func (s *scraper) scrape(_ context.Context) (pdata.Metrics, error) {
-	now := pdata.NewTimestampFromTime(time.Now())
+func (s *processesScraper) scrape(ctx context.Context) (pmetric.Metrics, error) {
+	now := pcommon.NewTimestampFromTime(time.Now())
 
-	md := pdata.NewMetrics()
-	metrics := md.ResourceMetrics().AppendEmpty().InstrumentationLibraryMetrics().AppendEmpty().Metrics()
+	md := pmetric.NewMetrics()
+	metrics := md.ResourceMetrics().AppendEmpty().ScopeMetrics().AppendEmpty().Metrics()
 	metrics.EnsureCapacity(metricsLength)
 
-	processMetadata, err := s.getProcessesMetadata()
+	processMetadata, err := s.getProcessesMetadata(ctx)
 	if err != nil {
-		return md, scrapererror.NewPartialScrapeError(err, metricsLength)
+		return pmetric.NewMetrics(), scrapererror.NewPartialScrapeError(err, metricsLength)
 	}
 
 	if enableProcessesCount && processMetadata.countByStatus != nil {
-		setProcessesCountMetric(metrics.AppendEmpty(), s.startTime, now, processMetadata.countByStatus)
+		for status, count := range processMetadata.countByStatus {
+			s.mb.RecordSystemProcessesCountDataPoint(now, count, status)
+		}
 	}
 
 	if enableProcessesCreated && processMetadata.processesCreated != nil {
-		setProcessesCreatedMetric(metrics.AppendEmpty(), s.startTime, now, *processMetadata.processesCreated)
+		s.mb.RecordSystemProcessesCreatedDataPoint(now, *processMetadata.processesCreated)
 	}
 
-	return md, err
-}
-
-func setProcessesCountMetric(metric pdata.Metric, startTime, now pdata.Timestamp, countByStatus map[string]int64) {
-	metadata.Metrics.SystemProcessesCount.Init(metric)
-	ddps := metric.Sum().DataPoints()
-
-	for status, count := range countByStatus {
-		setProcessesCountDataPoint(ddps.AppendEmpty(), startTime, now, status, count)
-	}
-}
-
-func setProcessesCountDataPoint(dataPoint pdata.NumberDataPoint, startTime, now pdata.Timestamp, statusLabel string, value int64) {
-	dataPoint.Attributes().InsertString(metadata.Attributes.Status, statusLabel)
-	dataPoint.SetStartTimestamp(startTime)
-	dataPoint.SetTimestamp(now)
-	dataPoint.SetIntVal(value)
-}
-
-func setProcessesCreatedMetric(metric pdata.Metric, startTime, now pdata.Timestamp, value int64) {
-	metadata.Metrics.SystemProcessesCreated.Init(metric)
-	ddp := metric.Sum().DataPoints().AppendEmpty()
-	ddp.SetStartTimestamp(startTime)
-	ddp.SetTimestamp(now)
-	ddp.SetIntVal(value)
+	return s.mb.Emit(), err
 }

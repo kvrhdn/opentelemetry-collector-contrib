@@ -1,121 +1,129 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
 package datadogexporter // import "github.com/open-telemetry/opentelemetry-collector-contrib/exporter/datadogexporter"
 
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
+	"sync"
 	"time"
 
-	"go.opentelemetry.io/collector/component"
-	"go.opentelemetry.io/collector/model/pdata"
-	"go.uber.org/multierr"
+	"github.com/DataDog/datadog-agent/pkg/trace/config"
+	"github.com/DataDog/datadog-api-client-go/v2/api/datadogV2"
+	"github.com/DataDog/opentelemetry-mapping-go/pkg/inframetadata"
+	"github.com/DataDog/opentelemetry-mapping-go/pkg/otlp/attributes"
+	"github.com/DataDog/opentelemetry-mapping-go/pkg/otlp/attributes/source"
+	otlpmetrics "github.com/DataDog/opentelemetry-mapping-go/pkg/otlp/metrics"
+	"go.opentelemetry.io/collector/exporter"
+	"go.opentelemetry.io/collector/featuregate"
+	"go.opentelemetry.io/collector/pdata/pcommon"
+	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.uber.org/zap"
-	"gopkg.in/zorkian/go-datadog-api.v2"
+	zorkian "gopkg.in/zorkian/go-datadog-api.v2"
 
-	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/datadogexporter/config"
-	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/datadogexporter/internal/metadata"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/datadogexporter/internal/clientutil"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/datadogexporter/internal/hostmetadata"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/datadogexporter/internal/metrics"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/datadogexporter/internal/metrics/sketches"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/datadogexporter/internal/scrub"
-	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/datadogexporter/internal/sketches"
-	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/datadogexporter/internal/translator"
-	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/datadogexporter/internal/utils"
 )
 
+var metricRemappingDisableddFeatureGate = featuregate.GlobalRegistry().MustRegister(
+	"exporter.datadogexporter.metricremappingdisabled",
+	featuregate.StageAlpha,
+	featuregate.WithRegisterDescription("When enabled the Datadog Exporter remaps OpenTelemetry semantic conventions to Datadog semantic conventions. This feature gate is only for internal use."),
+	featuregate.WithRegisterReferenceURL("https://docs.datadoghq.com/opentelemetry/schema_semantics/metrics_mapping/"),
+)
+
+// isMetricRemappingDisabled returns true if the datadogexporter should generate Datadog-compliant metrics from OpenTelemetry metrics
+func isMetricRemappingDisabled() bool {
+	return metricRemappingDisableddFeatureGate.IsEnabled()
+}
+
 type metricsExporter struct {
-	params   component.ExporterCreateSettings
-	cfg      *config.Config
-	ctx      context.Context
-	client   *datadog.Client
-	tr       *translator.Translator
-	scrubber scrub.Scrubber
-	retrier  *utils.Retrier
+	params           exporter.Settings
+	cfg              *Config
+	agntConfig       *config.AgentConfig
+	ctx              context.Context
+	client           *zorkian.Client
+	metricsAPI       *datadogV2.MetricsApi
+	tr               *otlpmetrics.Translator
+	scrubber         scrub.Scrubber
+	retrier          *clientutil.Retrier
+	onceMetadata     *sync.Once
+	sourceProvider   source.Provider
+	metadataReporter *inframetadata.Reporter
+	// getPushTime returns a Unix time in nanoseconds, representing the time pushing metrics.
+	// It will be overwritten in tests.
+	getPushTime func() uint64
 }
 
-// assert `hostProvider` implements HostnameProvider interface
-var _ translator.HostnameProvider = (*hostProvider)(nil)
-
-type hostProvider struct {
-	logger *zap.Logger
-	cfg    *config.Config
-}
-
-func (p *hostProvider) Hostname(context.Context) (string, error) {
-	return metadata.GetHost(p.logger, p.cfg), nil
-}
-
-// translatorFromConfig creates a new metrics translator from the exporter config.
-func translatorFromConfig(logger *zap.Logger, cfg *config.Config) (*translator.Translator, error) {
-	options := []translator.Option{
-		translator.WithDeltaTTL(cfg.Metrics.DeltaTTL),
-		translator.WithFallbackHostnameProvider(&hostProvider{logger, cfg}),
-	}
-
-	if cfg.Metrics.HistConfig.SendCountSum {
-		options = append(options, translator.WithCountSumMetrics())
-	}
-
-	if cfg.Metrics.Quantiles {
-		options = append(options, translator.WithQuantiles())
-	}
-
-	if cfg.Metrics.ExporterConfig.ResourceAttributesAsTags {
-		options = append(options, translator.WithResourceAttributesAsTags())
-	}
-
-	if cfg.Metrics.ExporterConfig.InstrumentationLibraryMetadataAsTags {
-		options = append(options, translator.WithInstrumentationLibraryMetadataAsTags())
-	}
-
-	options = append(options, translator.WithHistogramMode(translator.HistogramMode(cfg.Metrics.HistConfig.Mode)))
-
-	var numberMode translator.NumberMode
-	if cfg.Metrics.SendMonotonic {
-		numberMode = translator.NumberModeCumulativeToDelta
+func newMetricsExporter(
+	ctx context.Context,
+	params exporter.Settings,
+	cfg *Config,
+	agntConfig *config.AgentConfig,
+	onceMetadata *sync.Once,
+	attrsTranslator *attributes.Translator,
+	sourceProvider source.Provider,
+	metadataReporter *inframetadata.Reporter,
+	statsOut chan []byte,
+) (*metricsExporter, error) {
+	options := cfg.Metrics.ToTranslatorOpts()
+	options = append(options, otlpmetrics.WithFallbackSourceProvider(sourceProvider))
+	options = append(options, otlpmetrics.WithStatsOut(statsOut))
+	if isMetricRemappingDisabled() {
+		params.TelemetrySettings.Logger.Warn("Metric remapping is disabled in the Datadog exporter. OpenTelemetry metrics must be mapped to Datadog semantics before metrics are exported to Datadog (ex: via a processor).")
 	} else {
-		numberMode = translator.NumberModeRawValue
+		options = append(options, otlpmetrics.WithRemapping())
 	}
-	options = append(options, translator.WithNumberMode(numberMode))
 
-	return translator.New(logger, options...)
-}
-
-func newMetricsExporter(ctx context.Context, params component.ExporterCreateSettings, cfg *config.Config) (*metricsExporter, error) {
-	client := utils.CreateClient(cfg.API.Key, cfg.Metrics.TCPAddr.Endpoint)
-	client.ExtraHeader["User-Agent"] = utils.UserAgent(params.BuildInfo)
-	client.HttpClient = utils.NewHTTPClient(cfg.TimeoutSettings, cfg.LimitedHTTPClientSettings)
-
-	utils.ValidateAPIKey(params.Logger, client)
-
-	tr, err := translatorFromConfig(params.Logger, cfg)
+	tr, err := otlpmetrics.NewTranslator(params.TelemetrySettings, attrsTranslator, options...)
 	if err != nil {
 		return nil, err
 	}
 
 	scrubber := scrub.NewScrubber()
-	return &metricsExporter{
-		params:   params,
-		cfg:      cfg,
-		ctx:      ctx,
-		client:   client,
-		tr:       tr,
-		scrubber: scrubber,
-		retrier:  utils.NewRetrier(params.Logger, cfg.RetrySettings, scrubber),
-	}, nil
+	exporter := &metricsExporter{
+		params:           params,
+		cfg:              cfg,
+		ctx:              ctx,
+		agntConfig:       agntConfig,
+		tr:               tr,
+		scrubber:         scrubber,
+		retrier:          clientutil.NewRetrier(params.Logger, cfg.BackOffConfig, scrubber),
+		onceMetadata:     onceMetadata,
+		sourceProvider:   sourceProvider,
+		getPushTime:      func() uint64 { return uint64(time.Now().UTC().UnixNano()) },
+		metadataReporter: metadataReporter,
+	}
+	errchan := make(chan error)
+	if isMetricExportV2Enabled() {
+		apiClient := clientutil.CreateAPIClient(
+			params.BuildInfo,
+			cfg.Metrics.TCPAddrConfig.Endpoint,
+			cfg.ClientConfig)
+		go func() { errchan <- clientutil.ValidateAPIKey(ctx, string(cfg.API.Key), params.Logger, apiClient) }()
+		exporter.metricsAPI = datadogV2.NewMetricsApi(apiClient)
+	} else {
+		client := clientutil.CreateZorkianClient(string(cfg.API.Key), cfg.Metrics.TCPAddrConfig.Endpoint)
+		client.ExtraHeader["User-Agent"] = clientutil.UserAgent(params.BuildInfo)
+		client.HttpClient = clientutil.NewHTTPClient(cfg.ClientConfig)
+		go func() { errchan <- clientutil.ValidateAPIKeyZorkian(params.Logger, client) }()
+		exporter.client = client
+	}
+	if cfg.API.FailOnInvalidKey {
+		err = <-errchan
+		if err != nil {
+			return nil, err
+		}
+	}
+	return exporter, nil
 }
 
 func (exp *metricsExporter) pushSketches(ctx context.Context, sl sketches.SketchSeriesList) error {
@@ -126,74 +134,114 @@ func (exp *metricsExporter) pushSketches(ctx context.Context, sl sketches.Sketch
 
 	req, err := http.NewRequestWithContext(ctx,
 		http.MethodPost,
-		exp.cfg.Metrics.TCPAddr.Endpoint+sketches.SketchSeriesEndpoint,
+		exp.cfg.Metrics.TCPAddrConfig.Endpoint+sketches.SketchSeriesEndpoint,
 		bytes.NewBuffer(payload),
 	)
 	if err != nil {
 		return fmt.Errorf("failed to build sketches HTTP request: %w", err)
 	}
 
-	utils.SetDDHeaders(req.Header, exp.params.BuildInfo, exp.cfg.API.Key)
-	utils.SetExtraHeaders(req.Header, utils.ProtobufHeaders)
-	resp, err := exp.client.HttpClient.Do(req)
+	clientutil.SetDDHeaders(req.Header, exp.params.BuildInfo, string(exp.cfg.API.Key))
+	clientutil.SetExtraHeaders(req.Header, clientutil.ProtobufHeaders)
+	var resp *http.Response
+	if isMetricExportV2Enabled() {
+		resp, err = exp.metricsAPI.Client.Cfg.HTTPClient.Do(req)
+	} else {
+		resp, err = exp.client.HttpClient.Do(req)
+	}
 
 	if err != nil {
-		return fmt.Errorf("failed to do sketches HTTP request: %w", err)
+		return clientutil.WrapError(fmt.Errorf("failed to do sketches HTTP request: %w", err), resp)
 	}
 	defer resp.Body.Close()
 
+	// We must read the full response body from the http request to ensure that connections can be
+	// properly re-used. https://pkg.go.dev/net/http#Client.Do
+	_, err = io.Copy(io.Discard, resp.Body)
+	if err != nil {
+		return clientutil.WrapError(fmt.Errorf("failed to read response body from sketches HTTP request: %w", err), resp)
+	}
+
 	if resp.StatusCode >= 400 {
-		return fmt.Errorf("error when sending payload to %s: %s", sketches.SketchSeriesEndpoint, resp.Status)
+		return clientutil.WrapError(fmt.Errorf("error when sending payload to %s: %s", sketches.SketchSeriesEndpoint, resp.Status), resp)
 	}
 	return nil
 }
 
-func (exp *metricsExporter) PushMetricsDataScrubbed(ctx context.Context, md pdata.Metrics) error {
+func (exp *metricsExporter) PushMetricsDataScrubbed(ctx context.Context, md pmetric.Metrics) error {
 	return exp.scrubber.Scrub(exp.PushMetricsData(ctx, md))
 }
 
-func (exp *metricsExporter) PushMetricsData(ctx context.Context, md pdata.Metrics) error {
-
-	// Start host metadata with resource attributes from
-	// the first payload.
-	if exp.cfg.SendMetadata {
-		once := exp.cfg.OnceMetadata()
-		once.Do(func() {
-			attrs := pdata.NewAttributeMap()
+func (exp *metricsExporter) PushMetricsData(ctx context.Context, md pmetric.Metrics) error {
+	if exp.cfg.HostMetadata.Enabled {
+		// Start host metadata with resource attributes from
+		// the first payload.
+		exp.onceMetadata.Do(func() {
+			attrs := pcommon.NewMap()
 			if md.ResourceMetrics().Len() > 0 {
 				attrs = md.ResourceMetrics().At(0).Resource().Attributes()
 			}
-			go metadata.Pusher(exp.ctx, exp.params, exp.cfg, attrs)
+			go hostmetadata.RunPusher(exp.ctx, exp.params, newMetadataConfigfromConfig(exp.cfg), exp.sourceProvider, attrs, exp.metadataReporter)
 		})
-	}
 
-	consumer := metrics.NewConsumer()
-	pushTime := uint64(time.Now().UTC().UnixNano())
-	err := exp.tr.MapMetrics(ctx, md, consumer)
+		// Consume resources for host metadata
+		for i := 0; i < md.ResourceMetrics().Len(); i++ {
+			res := md.ResourceMetrics().At(i).Resource()
+			consumeResource(exp.metadataReporter, res, exp.params.Logger)
+		}
+	}
+	var consumer otlpmetrics.Consumer
+	if isMetricExportV2Enabled() {
+		consumer = metrics.NewConsumer()
+	} else {
+		consumer = metrics.NewZorkianConsumer()
+	}
+	metadata, err := exp.tr.MapMetrics(ctx, md, consumer)
 	if err != nil {
 		return fmt.Errorf("failed to map metrics: %w", err)
 	}
-	ms, sl := consumer.All(pushTime, exp.params.BuildInfo)
-	metrics.ProcessMetrics(ms, exp.cfg)
+	src, err := exp.sourceProvider.Source(ctx)
+	if err != nil {
+		return err
+	}
+	var tags []string
+	if src.Kind == source.AWSECSFargateKind {
+		tags = append(tags, exp.cfg.HostMetadata.Tags...)
+	}
 
-	err = nil
-	if len(ms) > 0 {
-		err = multierr.Append(
-			err,
-			exp.retrier.DoWithRetries(ctx, func(context.Context) error {
+	var sl sketches.SketchSeriesList
+	var errs []error
+	if isMetricExportV2Enabled() {
+		var ms []datadogV2.MetricSeries
+		ms, sl = consumer.(*metrics.Consumer).All(exp.getPushTime(), exp.params.BuildInfo, tags, metadata)
+		if len(ms) > 0 {
+			exp.params.Logger.Debug("exporting native Datadog payload", zap.Any("metric", ms))
+			_, experr := exp.retrier.DoWithRetries(ctx, func(context.Context) error {
+				ctx = clientutil.GetRequestContext(ctx, string(exp.cfg.API.Key))
+				_, httpresp, merr := exp.metricsAPI.SubmitMetrics(ctx, datadogV2.MetricPayload{Series: ms}, *clientutil.GZipSubmitMetricsOptionalParameters)
+				return clientutil.WrapError(merr, httpresp)
+			})
+			errs = append(errs, experr)
+		}
+	} else {
+		var ms []zorkian.Metric
+		ms, sl = consumer.(*metrics.ZorkianConsumer).All(exp.getPushTime(), exp.params.BuildInfo, tags)
+		if len(ms) > 0 {
+			exp.params.Logger.Debug("exporting Zorkian Datadog payload", zap.Any("metric", ms))
+			_, experr := exp.retrier.DoWithRetries(ctx, func(context.Context) error {
 				return exp.client.PostMetrics(ms)
-			}),
-		)
+			})
+			errs = append(errs, experr)
+		}
 	}
 
 	if len(sl) > 0 {
-		err = multierr.Append(
-			err,
-			exp.retrier.DoWithRetries(ctx, func(ctx context.Context) error {
-				return exp.pushSketches(ctx, sl)
-			}),
-		)
+		exp.params.Logger.Debug("exporting sketches payload", zap.Any("sketches", sl))
+		_, experr := exp.retrier.DoWithRetries(ctx, func(ctx context.Context) error {
+			return exp.pushSketches(ctx, sl)
+		})
+		errs = append(errs, experr)
 	}
 
-	return err
+	return errors.Join(errs...)
 }

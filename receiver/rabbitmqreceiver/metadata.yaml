@@ -1,15 +1,33 @@
-name: rabbitmqreceiver
+type: rabbitmq
 
-attributes:
+status:
+  class: receiver
+  stability:
+    beta: [metrics]
+  distributions: [contrib]
+  codeowners:
+    active: [cpheps]
+    seeking_new: true
+
+resource_attributes:
   rabbitmq.queue.name:
     description: The name of the RabbitMQ queue.
+    enabled: true
+    type: string
   rabbitmq.node.name:
     description: The name of the RabbitMQ node.
+    enabled: true
+    type: string
   rabbitmq.vhost.name:
     description: The name of the RabbitMQ vHost.
+    enabled: true
+    type: string
+
+attributes:
   message.state:
-    value: state
+    name_override: state
     description: The state of messages in a queue.
+    type: string
     enum:
       - ready
       - unacknowledged
@@ -19,7 +37,7 @@ metrics:
     unit: "{consumers}"
     sum:
       monotonic: false
-      aggregation: cumulative
+      aggregation_temporality: cumulative
       value_type: int
     enabled: true
   rabbitmq.message.delivered:
@@ -27,7 +45,7 @@ metrics:
     unit: "{messages}"
     sum:
       monotonic: true
-      aggregation: cumulative
+      aggregation_temporality: cumulative
       value_type: int
     enabled: true
   rabbitmq.message.published:
@@ -35,7 +53,7 @@ metrics:
     unit: "{messages}"
     sum:
       monotonic: true
-      aggregation: cumulative
+      aggregation_temporality: cumulative
       value_type: int
     enabled: true
   rabbitmq.message.acknowledged:
@@ -43,7 +61,7 @@ metrics:
     unit: "{messages}"
     sum:
       monotonic: true
-      aggregation: cumulative
+      aggregation_temporality: cumulative
       value_type: int
     enabled: true
   rabbitmq.message.dropped:
@@ -51,7 +69,7 @@ metrics:
     unit: "{messages}"
     sum:
       monotonic: true
-      aggregation: cumulative
+      aggregation_temporality: cumulative
       value_type: int
     enabled: true
   rabbitmq.message.current:
@@ -59,7 +77,7 @@ metrics:
     unit: "{messages}"
     sum:
       monotonic: false
-      aggregation: cumulative
+      aggregation_temporality: cumulative
       value_type: int
     attributes: [message.state]
     enabled: true

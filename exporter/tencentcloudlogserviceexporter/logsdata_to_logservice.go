@@ -1,16 +1,5 @@
-// Copyright 2021, OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
 
 package tencentcloudlogserviceexporter // import "github.com/open-telemetry/opentelemetry-collector-contrib/exporter/tencentcloudlogserviceexporter"
 
@@ -19,11 +8,13 @@ import (
 	"strconv"
 	"time"
 
-	"go.opentelemetry.io/collector/model/pdata"
-	conventions "go.opentelemetry.io/collector/model/semconv/v1.5.0"
+	"go.opentelemetry.io/collector/pdata/pcommon"
+	"go.opentelemetry.io/collector/pdata/plog"
+	conventions "go.opentelemetry.io/collector/semconv/v1.27.0"
 	"google.golang.org/protobuf/proto"
 
 	cls "github.com/open-telemetry/opentelemetry-collector-contrib/exporter/tencentcloudlogserviceexporter/proto"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/coreinternal/traceutil"
 )
 
 const (
@@ -44,18 +35,18 @@ const (
 	clsLogInstrumentationVersion = "otlp.version"
 )
 
-func convertLogs(ld pdata.Logs) []*cls.Log {
+func convertLogs(ld plog.Logs) []*cls.Log {
 	clsLogs := make([]*cls.Log, 0, ld.LogRecordCount())
 
 	rls := ld.ResourceLogs()
 	for i := 0; i < rls.Len(); i++ {
 		rl := rls.At(i)
-		ills := rl.InstrumentationLibraryLogs()
+		ills := rl.ScopeLogs()
 		resource := rl.Resource()
 		resourceContents := resourceToLogContents(resource)
 		for j := 0; j < ills.Len(); j++ {
 			ils := ills.At(j)
-			instrumentationLibraryContents := instrumentationLibraryToLogContents(ils.InstrumentationLibrary())
+			instrumentationLibraryContents := instrumentationLibraryToLogContents(ils.Scope())
 			logs := ils.LogRecords()
 			for j := 0; j < logs.Len(); j++ {
 				clsLog := mapLogRecordToLogService(logs.At(j), resourceContents, instrumentationLibraryContents)
@@ -69,7 +60,7 @@ func convertLogs(ld pdata.Logs) []*cls.Log {
 	return clsLogs
 }
 
-func resourceToLogContents(resource pdata.Resource) []*cls.Log_Content {
+func resourceToLogContents(resource pcommon.Resource) []*cls.Log_Content {
 	attrs := resource.Attributes()
 
 	var hostname, serviceName string
@@ -81,8 +72,8 @@ func resourceToLogContents(resource pdata.Resource) []*cls.Log_Content {
 		serviceName = service.AsString()
 	}
 
-	fields := map[string]interface{}{}
-	attrs.Range(func(k string, v pdata.AttributeValue) bool {
+	fields := map[string]any{}
+	attrs.Range(func(k string, v pcommon.Value) bool {
 		if k == conventions.AttributeServiceName || k == conventions.AttributeHostName {
 			return true
 		}
@@ -110,23 +101,24 @@ func resourceToLogContents(resource pdata.Resource) []*cls.Log_Content {
 	}
 }
 
-func instrumentationLibraryToLogContents(instrumentationLibrary pdata.InstrumentationLibrary) []*cls.Log_Content {
+func instrumentationLibraryToLogContents(scope pcommon.InstrumentationScope) []*cls.Log_Content {
 	return []*cls.Log_Content{
 		{
 			Key:   proto.String(clsLogInstrumentationName),
-			Value: proto.String(instrumentationLibrary.Name()),
+			Value: proto.String(scope.Name()),
 		},
 		{
 			Key:   proto.String(clsLogInstrumentationVersion),
-			Value: proto.String(instrumentationLibrary.Version()),
+			Value: proto.String(scope.Version()),
 		},
 	}
 }
 
-func mapLogRecordToLogService(lr pdata.LogRecord,
+func mapLogRecordToLogService(lr plog.LogRecord,
 	resourceContents,
-	instrumentationLibraryContents []*cls.Log_Content) *cls.Log {
-	if lr.Body().Type() == pdata.AttributeValueTypeEmpty {
+	instrumentationLibraryContents []*cls.Log_Content,
+) *cls.Log {
+	if lr.Body().Type() == pcommon.ValueTypeEmpty {
 		return nil
 	}
 	var clsLog cls.Log
@@ -135,8 +127,8 @@ func mapLogRecordToLogService(lr pdata.LogRecord,
 	preAllocCount := 16
 	clsLog.Contents = make([]*cls.Log_Content, 0, preAllocCount+len(resourceContents)+len(instrumentationLibraryContents))
 
-	fields := map[string]interface{}{}
-	lr.Attributes().Range(func(k string, v pdata.AttributeValue) bool {
+	fields := map[string]any{}
+	lr.Attributes().Range(func(k string, v pcommon.Value) bool {
 		fields[k] = v.AsString()
 		return true
 	})
@@ -172,11 +164,11 @@ func mapLogRecordToLogService(lr pdata.LogRecord,
 		},
 		{
 			Key:   proto.String(traceIDField),
-			Value: proto.String(lr.TraceID().HexString()),
+			Value: proto.String(traceutil.TraceIDToHexOrEmptyString(lr.TraceID())),
 		},
 		{
 			Key:   proto.String(spanIDField),
-			Value: proto.String(lr.SpanID().HexString()),
+			Value: proto.String(traceutil.SpanIDToHexOrEmptyString(lr.SpanID())),
 		},
 	}
 

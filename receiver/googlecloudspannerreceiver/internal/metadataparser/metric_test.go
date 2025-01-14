@@ -1,16 +1,5 @@
-// Copyright  The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
 
 package metadataparser
 
@@ -19,7 +8,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"go.opentelemetry.io/collector/model/pdata"
+	"go.opentelemetry.io/collector/pdata/pmetric"
 
 	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/googlecloudspannerreceiver/internal/metadata"
 )
@@ -34,17 +23,17 @@ func TestMetric_ToMetricValueMetadata(t *testing.T) {
 	testCases := map[string]struct {
 		valueType        metadata.ValueType
 		dataType         MetricType
-		expectedDataType pdata.MetricDataType
+		expectedDataType pmetric.MetricType
 		expectError      bool
 	}{
-		"Value type is int and data type is gauge":     {metadata.IntValueType, MetricType{DataType: GaugeMetricDataType}, pdata.MetricDataTypeGauge, false},
-		"Value type is int and data type is sum":       {metadata.IntValueType, MetricType{DataType: SumMetricDataType, Aggregation: DeltaAggregationType, Monotonic: true}, pdata.MetricDataTypeSum, false},
-		"Value type is int and data type is unknown":   {metadata.IntValueType, MetricType{DataType: UnknownMetricDataType}, pdata.MetricDataTypeNone, true},
-		"Value type is float and data type is gauge":   {metadata.FloatValueType, MetricType{DataType: GaugeMetricDataType}, pdata.MetricDataTypeGauge, false},
-		"Value type is float and data type is sum":     {metadata.FloatValueType, MetricType{DataType: SumMetricDataType, Aggregation: DeltaAggregationType, Monotonic: true}, pdata.MetricDataTypeSum, false},
-		"Value type is float and data type is unknown": {metadata.FloatValueType, MetricType{DataType: UnknownMetricDataType}, pdata.MetricDataTypeNone, true},
-		"Value type is unknown and data type is gauge": {metadata.UnknownValueType, MetricType{DataType: GaugeMetricDataType}, pdata.MetricDataTypeNone, true},
-		"Value type is unknown and data type is sum":   {metadata.UnknownValueType, MetricType{DataType: SumMetricDataType, Aggregation: DeltaAggregationType, Monotonic: true}, pdata.MetricDataTypeNone, true},
+		"Value type is int and data type is gauge":     {metadata.IntValueType, MetricType{DataType: GaugeMetricDataType}, pmetric.MetricTypeGauge, false},
+		"Value type is int and data type is sum":       {metadata.IntValueType, MetricType{DataType: SumMetricDataType, Aggregation: DeltaAggregationType, Monotonic: true}, pmetric.MetricTypeSum, false},
+		"Value type is int and data type is unknown":   {metadata.IntValueType, MetricType{DataType: UnknownMetricDataType}, pmetric.MetricTypeEmpty, true},
+		"Value type is float and data type is gauge":   {metadata.FloatValueType, MetricType{DataType: GaugeMetricDataType}, pmetric.MetricTypeGauge, false},
+		"Value type is float and data type is sum":     {metadata.FloatValueType, MetricType{DataType: SumMetricDataType, Aggregation: DeltaAggregationType, Monotonic: true}, pmetric.MetricTypeSum, false},
+		"Value type is float and data type is unknown": {metadata.FloatValueType, MetricType{DataType: UnknownMetricDataType}, pmetric.MetricTypeEmpty, true},
+		"Value type is unknown and data type is gauge": {metadata.UnknownValueType, MetricType{DataType: GaugeMetricDataType}, pmetric.MetricTypeEmpty, true},
+		"Value type is unknown and data type is sum":   {metadata.UnknownValueType, MetricType{DataType: SumMetricDataType, Aggregation: DeltaAggregationType, Monotonic: true}, pmetric.MetricTypeEmpty, true},
 	}
 
 	for name, testCase := range testCases {
@@ -71,7 +60,7 @@ func TestMetric_ToMetricValueMetadata(t *testing.T) {
 				assert.Equal(t, metric.Name, valueMetadata.Name())
 				assert.Equal(t, metric.ColumnName, valueMetadata.ColumnName())
 				assert.Equal(t, metric.Unit, valueMetadata.Unit())
-				assert.Equal(t, testCase.expectedDataType, valueMetadata.DataType().MetricDataType())
+				assert.Equal(t, testCase.expectedDataType, valueMetadata.DataType().MetricType())
 				assert.Equal(t, metric.ValueType, valueMetadata.ValueType())
 			}
 		})

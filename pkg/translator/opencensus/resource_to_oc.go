@@ -1,16 +1,5 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//       http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
 package opencensus // import "github.com/open-telemetry/opentelemetry-collector-contrib/pkg/translator/opencensus"
 
@@ -21,8 +10,8 @@ import (
 	occommon "github.com/census-instrumentation/opencensus-proto/gen-go/agent/common/v1"
 	ocresource "github.com/census-instrumentation/opencensus-proto/gen-go/resource/v1"
 	"go.opencensus.io/resource/resourcekeys"
-	"go.opentelemetry.io/collector/model/pdata"
-	conventions "go.opentelemetry.io/collector/model/semconv/v1.5.0"
+	"go.opentelemetry.io/collector/pdata/pcommon"
+	conventions "go.opentelemetry.io/collector/semconv/v1.6.1"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/coreinternal/occonventions"
@@ -78,7 +67,7 @@ func getSDKLangToOCLangCodeMap() map[string]int32 {
 	return mappings
 }
 
-func internalResourceToOC(resource pdata.Resource) (*occommon.Node, *ocresource.Resource) {
+func internalResourceToOC(resource pcommon.Resource) (*occommon.Node, *ocresource.Resource) {
 	attrs := resource.Attributes()
 	if attrs.Len() == 0 {
 		return nil, nil
@@ -87,7 +76,7 @@ func internalResourceToOC(resource pdata.Resource) (*occommon.Node, *ocresource.
 	ocNode := &occommon.Node{}
 	ocResource := &ocresource.Resource{}
 	labels := make(map[string]string, attrs.Len())
-	attrs.Range(func(k string, v pdata.AttributeValue) bool {
+	attrs.Range(func(k string, v pcommon.Value) bool {
 		val := v.AsString()
 
 		switch k {

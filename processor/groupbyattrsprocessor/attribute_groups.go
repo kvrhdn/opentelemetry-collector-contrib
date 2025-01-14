@@ -1,246 +1,159 @@
-// Copyright 2020 OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
 
 package groupbyattrsprocessor // import "github.com/open-telemetry/opentelemetry-collector-contrib/processor/groupbyattrsprocessor"
 
 import (
-	"go.opentelemetry.io/collector/model/pdata"
+	"go.opentelemetry.io/collector/pdata/pcommon"
+	"go.opentelemetry.io/collector/pdata/plog"
+	"go.opentelemetry.io/collector/pdata/pmetric"
+	"go.opentelemetry.io/collector/pdata/ptrace"
+
+	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/pdatautil"
 )
 
-func instrumentationLibrariesEqual(il1, il2 pdata.InstrumentationLibrary) bool {
+type tracesGroup struct {
+	traces         ptrace.Traces
+	resourceHashes [][16]byte
+}
+
+func newTracesGroup() *tracesGroup {
+	return &tracesGroup{traces: ptrace.NewTraces()}
+}
+
+// findOrCreateResource searches for a Resource with matching attributes and returns it. If nothing is found, it is being created
+func (tg *tracesGroup) findOrCreateResourceSpans(originResource pcommon.Resource, requiredAttributes pcommon.Map) ptrace.ResourceSpans {
+	referenceResource := buildReferenceResource(originResource, requiredAttributes)
+	referenceResourceHash := pdatautil.MapHash(referenceResource.Attributes())
+
+	rss := tg.traces.ResourceSpans()
+	for i := 0; i < rss.Len(); i++ {
+		if tg.resourceHashes[i] == referenceResourceHash {
+			return rss.At(i)
+		}
+	}
+
+	rs := tg.traces.ResourceSpans().AppendEmpty()
+	referenceResource.MoveTo(rs.Resource())
+	tg.resourceHashes = append(tg.resourceHashes, referenceResourceHash)
+	return rs
+}
+
+type metricsGroup struct {
+	metrics        pmetric.Metrics
+	resourceHashes [][16]byte
+}
+
+func newMetricsGroup() *metricsGroup {
+	return &metricsGroup{metrics: pmetric.NewMetrics()}
+}
+
+// findOrCreateResourceMetrics searches for a Resource with matching attributes and returns it. If nothing is found, it is being created
+func (mg *metricsGroup) findOrCreateResourceMetrics(originResource pcommon.Resource, requiredAttributes pcommon.Map) pmetric.ResourceMetrics {
+	referenceResource := buildReferenceResource(originResource, requiredAttributes)
+	referenceResourceHash := pdatautil.MapHash(referenceResource.Attributes())
+
+	rms := mg.metrics.ResourceMetrics()
+	for i := 0; i < rms.Len(); i++ {
+		if mg.resourceHashes[i] == referenceResourceHash {
+			return rms.At(i)
+		}
+	}
+
+	rm := mg.metrics.ResourceMetrics().AppendEmpty()
+	referenceResource.MoveTo(rm.Resource())
+	mg.resourceHashes = append(mg.resourceHashes, referenceResourceHash)
+	return rm
+}
+
+type logsGroup struct {
+	logs           plog.Logs
+	resourceHashes [][16]byte
+}
+
+// newLogsGroup returns new logsGroup with predefined capacity
+func newLogsGroup() *logsGroup {
+	return &logsGroup{logs: plog.NewLogs()}
+}
+
+// findOrCreateResourceLogs searches for a Resource with matching attributes and returns it. If nothing is found, it is being created
+func (lg *logsGroup) findOrCreateResourceLogs(originResource pcommon.Resource, requiredAttributes pcommon.Map) plog.ResourceLogs {
+	referenceResource := buildReferenceResource(originResource, requiredAttributes)
+	referenceResourceHash := pdatautil.MapHash(referenceResource.Attributes())
+
+	rls := lg.logs.ResourceLogs()
+	for i := 0; i < rls.Len(); i++ {
+		if lg.resourceHashes[i] == referenceResourceHash {
+			return rls.At(i)
+		}
+	}
+
+	rl := lg.logs.ResourceLogs().AppendEmpty()
+	referenceResource.MoveTo(rl.Resource())
+	lg.resourceHashes = append(lg.resourceHashes, referenceResourceHash)
+	return rl
+}
+
+func instrumentationLibrariesEqual(il1, il2 pcommon.InstrumentationScope) bool {
 	return il1.Name() == il2.Name() && il1.Version() == il2.Version()
 }
 
-// matchingInstrumentationLibrarySpans searches for a pdata.InstrumentationLibrarySpans instance matching
-// given InstrumentationLibrary. If nothing is found, it creates a new one
-func matchingInstrumentationLibrarySpans(rl pdata.ResourceSpans, library pdata.InstrumentationLibrary) pdata.InstrumentationLibrarySpans {
-	ilss := rl.InstrumentationLibrarySpans()
+// matchingScopeSpans searches for a ptrace.ScopeSpans instance matching
+// given InstrumentationScope. If nothing is found, it creates a new one
+func matchingScopeSpans(rl ptrace.ResourceSpans, library pcommon.InstrumentationScope) ptrace.ScopeSpans {
+	ilss := rl.ScopeSpans()
 	for i := 0; i < ilss.Len(); i++ {
 		ils := ilss.At(i)
-		if instrumentationLibrariesEqual(ils.InstrumentationLibrary(), library) {
+		if instrumentationLibrariesEqual(ils.Scope(), library) {
 			return ils
 		}
 	}
 
 	ils := ilss.AppendEmpty()
-	library.CopyTo(ils.InstrumentationLibrary())
+	library.CopyTo(ils.Scope())
 	return ils
 }
 
-// matchingInstrumentationLibraryLogs searches for a pdata.InstrumentationLibraryLogs instance matching
-// given InstrumentationLibrary. If nothing is found, it creates a new one
-func matchingInstrumentationLibraryLogs(rl pdata.ResourceLogs, library pdata.InstrumentationLibrary) pdata.InstrumentationLibraryLogs {
-	ills := rl.InstrumentationLibraryLogs()
+// matchingScopeLogs searches for a plog.ScopeLogs instance matching
+// given InstrumentationScope. If nothing is found, it creates a new one
+func matchingScopeLogs(rl plog.ResourceLogs, library pcommon.InstrumentationScope) plog.ScopeLogs {
+	ills := rl.ScopeLogs()
 	for i := 0; i < ills.Len(); i++ {
-		ill := ills.At(i)
-		if instrumentationLibrariesEqual(ill.InstrumentationLibrary(), library) {
-			return ill
+		sl := ills.At(i)
+		if instrumentationLibrariesEqual(sl.Scope(), library) {
+			return sl
 		}
 	}
 
-	ill := ills.AppendEmpty()
-	library.CopyTo(ill.InstrumentationLibrary())
-	return ill
+	sl := ills.AppendEmpty()
+	library.CopyTo(sl.Scope())
+	return sl
 }
 
-// matchingInstrumentationLibraryMetrics searches for a pdata.InstrumentationLibraryMetrics instance matching
-// given InstrumentationLibrary. If nothing is found, it creates a new one
-func matchingInstrumentationLibraryMetrics(rm pdata.ResourceMetrics, library pdata.InstrumentationLibrary) pdata.InstrumentationLibraryMetrics {
-	ilms := rm.InstrumentationLibraryMetrics()
+// matchingScopeMetrics searches for a pmetric.ScopeMetrics instance matching
+// given InstrumentationScope. If nothing is found, it creates a new one
+func matchingScopeMetrics(rm pmetric.ResourceMetrics, library pcommon.InstrumentationScope) pmetric.ScopeMetrics {
+	ilms := rm.ScopeMetrics()
 	for i := 0; i < ilms.Len(); i++ {
 		ilm := ilms.At(i)
-		if instrumentationLibrariesEqual(ilm.InstrumentationLibrary(), library) {
+		if instrumentationLibrariesEqual(ilm.Scope(), library) {
 			return ilm
 		}
 	}
 
 	ilm := ilms.AppendEmpty()
-	library.CopyTo(ilm.InstrumentationLibrary())
+	library.CopyTo(ilm.Scope())
 	return ilm
 }
 
-// spansGroupedByAttrs keeps all found grouping attributes for spans, together with the matching records
-type spansGroupedByAttrs struct {
-	pdata.ResourceSpansSlice
-}
-
-// logsGroupedByAttrs keeps all found grouping attributes for logs, together with the matching records
-type logsGroupedByAttrs struct {
-	pdata.ResourceLogsSlice
-}
-
-// metricsGroupedByAttrs keeps all found grouping attributes for metrics, together with the matching records
-type metricsGroupedByAttrs struct {
-	pdata.ResourceMetricsSlice
-}
-
-func newLogsGroupedByAttrs() *logsGroupedByAttrs {
-	return &logsGroupedByAttrs{
-		ResourceLogsSlice: pdata.NewResourceLogsSlice(),
-	}
-}
-
-func newSpansGroupedByAttrs() *spansGroupedByAttrs {
-	return &spansGroupedByAttrs{
-		ResourceSpansSlice: pdata.NewResourceSpansSlice(),
-	}
-}
-
-func newMetricsGroupedByAttrs() *metricsGroupedByAttrs {
-	return &metricsGroupedByAttrs{
-		ResourceMetricsSlice: pdata.NewResourceMetricsSlice(),
-	}
-}
-
-// Build the Attributes that we'll be looking for in existing Resources as a merge of the Attributes
-// of the original Resource with the requested Attributes
-func buildReferenceAttributes(originResource pdata.Resource, requiredAttributes pdata.AttributeMap) pdata.AttributeMap {
-	referenceAttributes := pdata.NewAttributeMap()
-	originResource.Attributes().CopyTo(referenceAttributes)
-	requiredAttributes.Range(func(k string, v pdata.AttributeValue) bool {
-		referenceAttributes.Upsert(k, v)
+// buildReferenceResource returns a new resource that we'll be looking for in existing Resources
+// as a merge of the Attributes of the original Resource with the requested Attributes.
+func buildReferenceResource(originResource pcommon.Resource, requiredAttributes pcommon.Map) pcommon.Resource {
+	referenceResource := pcommon.NewResource()
+	originResource.Attributes().CopyTo(referenceResource.Attributes())
+	requiredAttributes.Range(func(k string, v pcommon.Value) bool {
+		v.CopyTo(referenceResource.Attributes().PutEmpty(k))
 		return true
 	})
-	return referenceAttributes
-}
-
-// resourceMatches verifies if given pdata.Resource attributes strictly match with the specified
-// reference Attributes (all attributes must match strictly)
-func resourceMatches(resource pdata.Resource, referenceAttributes pdata.AttributeMap) bool {
-
-	// If not the same number of attributes, it doesn't match
-	if referenceAttributes.Len() != resource.Attributes().Len() {
-		return false
-	}
-
-	// Go through each attribute and check the corresponding attribute value in the tested Resource
-	matching := true
-	referenceAttributes.Range(func(referenceKey string, referenceValue pdata.AttributeValue) bool {
-		testedValue, foundKey := resource.Attributes().Get(referenceKey)
-		if !foundKey || !referenceValue.Equal(testedValue) {
-			// One difference is enough to consider it doesn't match, so fail early
-			matching = false
-			return false
-		}
-		return true
-	})
-
-	return matching
-}
-
-// findResource searches for an existing pdata.ResourceLogs that strictly matches with the specified reference
-// Attributes. Returns the matching pdata.ResourceLogs and bool value which is set to true if found
-func (lgba logsGroupedByAttrs) findResource(referenceAttributes pdata.AttributeMap) (pdata.ResourceLogs, bool) {
-	for i := 0; i < lgba.Len(); i++ {
-		if resourceMatches(lgba.At(i).Resource(), referenceAttributes) {
-			return lgba.At(i), true
-		}
-	}
-	return pdata.ResourceLogs{}, false
-}
-
-// findResource searches for an existing pdata.ResourceLogs that strictly matches with the specified reference
-// Attributes. Returns the matching pdata.ResourceLogs and bool value which is set to true if found
-func (sgba spansGroupedByAttrs) findResource(referenceAttributes pdata.AttributeMap) (pdata.ResourceSpans, bool) {
-	for i := 0; i < sgba.Len(); i++ {
-		if resourceMatches(sgba.At(i).Resource(), referenceAttributes) {
-			return sgba.At(i), true
-		}
-	}
-	return pdata.ResourceSpans{}, false
-}
-
-// findResource searches for an existing pdata.ResourceMetrics that strictly matches with the specified reference
-// Attributes. Returns the matching pdata.ResourceMetrics and bool value which is set to true if found
-func (mgba metricsGroupedByAttrs) findResource(referenceAttributes pdata.AttributeMap) (pdata.ResourceMetrics, bool) {
-
-	for i := 0; i < mgba.Len(); i++ {
-		if resourceMatches(mgba.At(i).Resource(), referenceAttributes) {
-			return mgba.At(i), true
-		}
-	}
-	return pdata.ResourceMetrics{}, false
-}
-
-// Update the specified (and new) Resource with the properties of the original Resource, and with the
-// required Attributes
-func updateResourceToMatch(newResource pdata.Resource, originResource pdata.Resource, requiredAttributes pdata.AttributeMap) {
-
-	originResource.CopyTo(newResource)
-
-	// This prioritizes required attributes over the original resource attributes, if they overlap
-	attrs := newResource.Attributes()
-	requiredAttributes.Range(func(k string, v pdata.AttributeValue) bool {
-		attrs.Upsert(k, v)
-		return true
-	})
-
-}
-
-// findOrCreateResource searches for a Resource with matching attributes and returns it. If nothing is found, it is being created
-func (sgba *spansGroupedByAttrs) findOrCreateResource(originResource pdata.Resource, requiredAttributes pdata.AttributeMap) pdata.ResourceSpans {
-
-	// Build the reference attributes that we're looking for in Resources
-	referenceAttributes := buildReferenceAttributes(originResource, requiredAttributes)
-
-	// Do we have a matching Resource?
-	resource, found := sgba.findResource(referenceAttributes)
-	if found {
-		return resource
-	}
-
-	// Not found: create a new resource
-	resource = sgba.AppendEmpty()
-	updateResourceToMatch(resource.Resource(), originResource, requiredAttributes)
-	return resource
-
-}
-
-// findResourceOrElseCreate searches for a Resource with matching attributes and returns it. If nothing is found, it is being created
-func (lgba *logsGroupedByAttrs) findResourceOrElseCreate(originResource pdata.Resource, requiredAttributes pdata.AttributeMap) pdata.ResourceLogs {
-
-	// Build the reference attributes that we're looking for in Resources
-	referenceAttributes := buildReferenceAttributes(originResource, requiredAttributes)
-
-	// Do we have a matching Resource?
-	resource, found := lgba.findResource(referenceAttributes)
-	if found {
-		return resource
-	}
-
-	// Not found: create a new resource
-	resource = lgba.AppendEmpty()
-	updateResourceToMatch(resource.Resource(), originResource, requiredAttributes)
-	return resource
-
-}
-
-// findResourceOrElseCreate searches for a Resource with matching attributes and returns it. If nothing is found, it is being created
-func (mgba *metricsGroupedByAttrs) findResourceOrElseCreate(originResource pdata.Resource, requiredAttributes pdata.AttributeMap) pdata.ResourceMetrics {
-
-	// Build the reference attributes that we're looking for in Resources
-	referenceAttributes := buildReferenceAttributes(originResource, requiredAttributes)
-
-	// Do we have a matching Resource?
-	resource, found := mgba.findResource(referenceAttributes)
-	if found {
-		return resource
-	}
-
-	// Not found: create a new resource
-	resource = mgba.AppendEmpty()
-	updateResourceToMatch(resource.Resource(), originResource, requiredAttributes)
-	return resource
-
+	return referenceResource
 }

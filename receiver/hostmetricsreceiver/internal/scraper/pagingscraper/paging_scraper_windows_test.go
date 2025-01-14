@@ -1,19 +1,7 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//       http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
 //go:build windows
-// +build windows
 
 package pagingscraper
 
@@ -25,27 +13,31 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/collector/component/componenttest"
-	"go.opentelemetry.io/collector/receiver/scrapererror"
+	"go.opentelemetry.io/collector/receiver/receivertest"
+	"go.opentelemetry.io/collector/scraper/scrapererror"
 
 	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/hostmetricsreceiver/internal/perfcounters"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/hostmetricsreceiver/internal/scraper/pagingscraper/internal/metadata"
 )
 
 func TestScrape_Errors(t *testing.T) {
 	type testCase struct {
-		name              string
-		pageSize          uint64
-		getPageFileStats  func() ([]*pageFileStats, error)
-		scrapeErr         error
-		getObjectErr      error
-		getValuesErr      error
-		expectedErr       string
-		expectedErrCount  int
-		expectedUsedValue int64
-		expectedFreeValue int64
+		name                         string
+		pageSize                     uint64
+		getPageFileStats             func() ([]*pageFileStats, error)
+		scrapeErr                    error
+		getObjectErr                 error
+		getValuesErr                 error
+		expectedErr                  string
+		expectedErrCount             int
+		expectedUsedValue            int64
+		expectedFreeValue            int64
+		expectedUtilizationFreeValue float64
+		expectedUtilizationUsedValue float64
 	}
 
 	testPageSize := uint64(4096)
-	testPageFileData := &pageFileStats{usedBytes: 100, freeBytes: 200}
+	testPageFileData := &pageFileStats{usedBytes: 200, freeBytes: 800, totalBytes: 1000}
 
 	testCases := []testCase{
 		{
@@ -54,13 +46,15 @@ func TestScrape_Errors(t *testing.T) {
 			getPageFileStats: func() ([]*pageFileStats, error) {
 				return []*pageFileStats{testPageFileData}, nil
 			},
-			expectedUsedValue: int64(testPageFileData.usedBytes),
-			expectedFreeValue: int64(testPageFileData.freeBytes),
+			expectedUsedValue:            int64(testPageFileData.usedBytes),
+			expectedFreeValue:            int64(testPageFileData.freeBytes),
+			expectedUtilizationFreeValue: 0.8,
+			expectedUtilizationUsedValue: 0.2,
 		},
 		{
 			name:             "pageFileError",
 			getPageFileStats: func() ([]*pageFileStats, error) { return nil, errors.New("err1") },
-			expectedErr:      "err1",
+			expectedErr:      "failed to read page file stats: err1",
 			expectedErrCount: pagingUsageMetricsLen,
 		},
 		{
@@ -85,14 +79,17 @@ func TestScrape_Errors(t *testing.T) {
 			name:             "multipleErrors",
 			getPageFileStats: func() ([]*pageFileStats, error) { return nil, errors.New("err1") },
 			getObjectErr:     errors.New("err2"),
-			expectedErr:      "[err1; err2]",
+			expectedErr:      "failed to read page file stats: err1; err2",
 			expectedErrCount: pagingUsageMetricsLen + pagingMetricsLen,
 		},
 	}
 
 	for _, test := range testCases {
 		t.Run(test.name, func(t *testing.T) {
-			scraper := newPagingScraper(context.Background(), &Config{})
+			metricsConfig := metadata.DefaultMetricsBuilderConfig()
+			metricsConfig.Metrics.SystemPagingUtilization.Enabled = true
+
+			scraper := newPagingScraper(context.Background(), receivertest.NewNopSettings(), &Config{MetricsBuilderConfig: metricsConfig})
 			if test.getPageFileStats != nil {
 				scraper.pageFileStats = test.getPageFileStats
 			}
@@ -102,11 +99,11 @@ func TestScrape_Errors(t *testing.T) {
 				pageSize = test.pageSize
 			} else {
 				pageSize = getPageSize()
-				assert.Greater(t, pageSize, uint64(0))
+				assert.Positive(t, pageSize)
 				assert.Zero(t, pageSize%4096) // page size on Windows should always be a multiple of 4KB
 			}
 
-			scraper.perfCounterScraper = perfcounters.NewMockPerfCounterScraperError(test.scrapeErr, test.getObjectErr, test.getValuesErr)
+			scraper.perfCounterScraper = perfcounters.NewMockPerfCounterScraperError(test.scrapeErr, test.getObjectErr, test.getValuesErr, nil)
 
 			err := scraper.start(context.Background(), componenttest.NewNopHost())
 			require.NoError(t, err, "Failed to initialize paging scraper: %v", err)
@@ -118,7 +115,9 @@ func TestScrape_Errors(t *testing.T) {
 				isPartial := scrapererror.IsPartialScrapeError(err)
 				assert.True(t, isPartial)
 				if isPartial {
-					assert.Equal(t, test.expectedErrCount, err.(scrapererror.PartialScrapeError).Failed)
+					var scraperErr scrapererror.PartialScrapeError
+					require.ErrorAs(t, err, &scraperErr)
+					assert.Equal(t, test.expectedErrCount, scraperErr.Failed)
 				}
 
 				return
@@ -126,10 +125,50 @@ func TestScrape_Errors(t *testing.T) {
 
 			assert.NoError(t, err)
 
-			metrics := md.ResourceMetrics().At(0).InstrumentationLibraryMetrics().At(0).Metrics()
+			metrics := md.ResourceMetrics().At(0).ScopeMetrics().At(0).Metrics()
 			pagingUsageMetric := metrics.At(0)
-			assert.Equal(t, test.expectedUsedValue, pagingUsageMetric.Sum().DataPoints().At(0).IntVal())
-			assert.Equal(t, test.expectedFreeValue, pagingUsageMetric.Sum().DataPoints().At(1).IntVal())
+			assert.Equal(t, test.expectedUsedValue, pagingUsageMetric.Sum().DataPoints().At(0).IntValue())
+			assert.Equal(t, test.expectedFreeValue, pagingUsageMetric.Sum().DataPoints().At(1).IntValue())
+
+			pagingUtilizationMetric := metrics.At(1)
+			assert.Equal(t, test.expectedUtilizationUsedValue, pagingUtilizationMetric.Gauge().DataPoints().At(0).DoubleValue())
+			assert.Equal(t, test.expectedUtilizationFreeValue, pagingUtilizationMetric.Gauge().DataPoints().At(1).DoubleValue())
+		})
+	}
+}
+
+func TestStart_Error(t *testing.T) {
+	testCases := []struct {
+		name               string
+		initError          error
+		expectedSkipScrape bool
+	}{
+		{
+			name:               "Perfcounter partially fails to init",
+			expectedSkipScrape: false,
+		},
+		{
+			name: "Perfcounter fully fails to init",
+			initError: &perfcounters.PerfCounterInitError{
+				FailedObjects: []string{"Memory"},
+			},
+			expectedSkipScrape: true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			metricsConfig := metadata.DefaultMetricsBuilderConfig()
+			metricsConfig.Metrics.SystemPagingUtilization.Enabled = true
+
+			scraper := newPagingScraper(context.Background(), receivertest.NewNopSettings(), &Config{MetricsBuilderConfig: metricsConfig})
+
+			scraper.perfCounterScraper = perfcounters.NewMockPerfCounterScraperError(nil, nil, nil, tc.initError)
+
+			err := scraper.start(context.Background(), componenttest.NewNopHost())
+			require.NoError(t, err, "Failed to initialize paging scraper: %v", err)
+
+			require.Equal(t, tc.expectedSkipScrape, scraper.skipScrape)
 		})
 	}
 }

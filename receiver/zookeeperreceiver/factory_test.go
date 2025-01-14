@@ -1,16 +1,5 @@
-// Copyright 2020, OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
 
 package zookeeperreceiver
 
@@ -21,15 +10,17 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"go.opentelemetry.io/collector/component/componenttest"
-	"go.opentelemetry.io/collector/config"
+	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/config/confignet"
 	"go.opentelemetry.io/collector/consumer/consumertest"
+	"go.opentelemetry.io/collector/receiver/receivertest"
+
+	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/zookeeperreceiver/internal/metadata"
 )
 
 func TestFactory(t *testing.T) {
 	f := NewFactory()
-	require.Equal(t, config.Type("zookeeper"), f.Type())
+	require.Equal(t, metadata.Type, f.Type())
 
 	cfg := f.CreateDefaultConfig()
 	rCfg := cfg.(*Config)
@@ -37,11 +28,11 @@ func TestFactory(t *testing.T) {
 	// Assert defaults.
 	assert.Equal(t, 10*time.Second, rCfg.CollectionInterval)
 	assert.Equal(t, 10*time.Second, rCfg.Timeout)
-	assert.Equal(t, ":2181", rCfg.Endpoint)
+	assert.Equal(t, "localhost:2181", rCfg.Endpoint)
 
 	tests := []struct {
 		name    string
-		config  config.Receiver
+		config  component.Config
 		wantErr bool
 	}{
 		{
@@ -56,7 +47,7 @@ func TestFactory(t *testing.T) {
 		{
 			name: "Invalid timeout",
 			config: &Config{
-				TCPAddr: confignet.TCPAddr{
+				TCPAddrConfig: confignet.TCPAddrConfig{
 					Endpoint: ":2181",
 				},
 			},
@@ -66,9 +57,9 @@ func TestFactory(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			r, err := f.CreateMetricsReceiver(
+			r, err := f.CreateMetrics(
 				context.Background(),
-				componenttest.NewNopReceiverCreateSettings(),
+				receivertest.NewNopSettings(),
 				test.config,
 				consumertest.NewNop(),
 			)

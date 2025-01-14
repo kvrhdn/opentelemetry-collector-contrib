@@ -1,102 +1,102 @@
-// Copyright 2020 OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
 
 package k8sattributesprocessor // import "github.com/open-telemetry/opentelemetry-collector-contrib/processor/k8sattributesprocessor"
 
 import (
 	"context"
-	"fmt"
+	"time"
 
 	"go.opentelemetry.io/collector/component"
-	"go.opentelemetry.io/collector/config"
 	"go.opentelemetry.io/collector/consumer"
-	conventions "go.opentelemetry.io/collector/model/semconv/v1.5.0"
+	"go.opentelemetry.io/collector/consumer/xconsumer"
+	"go.opentelemetry.io/collector/processor"
 	"go.opentelemetry.io/collector/processor/processorhelper"
-	"go.uber.org/zap"
+	"go.opentelemetry.io/collector/processor/processorhelper/xprocessorhelper"
+	"go.opentelemetry.io/collector/processor/xprocessor"
 
 	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/k8sconfig"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/k8sattributesprocessor/internal/kube"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/processor/k8sattributesprocessor/internal/metadata"
 )
 
-const (
-	// The value of "type" key in configuration.
-	typeStr = "k8sattributes"
+var (
+	kubeClientProvider   = kube.ClientProvider(nil)
+	consumerCapabilities = consumer.Capabilities{MutatesData: true}
+	defaultExcludes      = ExcludeConfig{Pods: []ExcludePodConfig{{Name: "jaeger-agent"}, {Name: "jaeger-collector"}}}
 )
-
-var kubeClientProvider = kube.ClientProvider(nil)
-var consumerCapabilities = consumer.Capabilities{MutatesData: true}
-var defaultExcludes = ExcludeConfig{Pods: []ExcludePodConfig{{Name: "jaeger-agent"}, {Name: "jaeger-collector"}}}
 
 // NewFactory returns a new factory for the k8s processor.
-func NewFactory() component.ProcessorFactory {
-	return processorhelper.NewFactory(
-		typeStr,
+func NewFactory() processor.Factory {
+	return xprocessor.NewFactory(
+		metadata.Type,
 		createDefaultConfig,
-		processorhelper.WithTraces(createTracesProcessor),
-		processorhelper.WithMetrics(createMetricsProcessor),
-		processorhelper.WithLogs(createLogsProcessor),
+		xprocessor.WithTraces(createTracesProcessor, metadata.TracesStability),
+		xprocessor.WithMetrics(createMetricsProcessor, metadata.MetricsStability),
+		xprocessor.WithLogs(createLogsProcessor, metadata.LogsStability),
+		xprocessor.WithProfiles(createProfilesProcessor, metadata.ProfilesStability),
 	)
 }
 
-func createDefaultConfig() config.Processor {
+func createDefaultConfig() component.Config {
 	return &Config{
-		ProcessorSettings: config.NewProcessorSettings(config.NewComponentID(typeStr)),
-		APIConfig:         k8sconfig.APIConfig{AuthType: k8sconfig.AuthTypeServiceAccount},
-		Exclude:           defaultExcludes,
+		APIConfig: k8sconfig.APIConfig{AuthType: k8sconfig.AuthTypeServiceAccount},
+		Exclude:   defaultExcludes,
+		Extract: ExtractConfig{
+			Metadata: enabledAttributes(),
+		},
+		WaitForMetadataTimeout: 10 * time.Second,
 	}
 }
 
 func createTracesProcessor(
 	ctx context.Context,
-	params component.ProcessorCreateSettings,
-	cfg config.Processor,
+	params processor.Settings,
+	cfg component.Config,
 	next consumer.Traces,
-) (component.TracesProcessor, error) {
+) (processor.Traces, error) {
 	return createTracesProcessorWithOptions(ctx, params, cfg, next)
 }
 
 func createLogsProcessor(
 	ctx context.Context,
-	params component.ProcessorCreateSettings,
-	cfg config.Processor,
+	params processor.Settings,
+	cfg component.Config,
 	nextLogsConsumer consumer.Logs,
-) (component.LogsProcessor, error) {
+) (processor.Logs, error) {
 	return createLogsProcessorWithOptions(ctx, params, cfg, nextLogsConsumer)
 }
 
 func createMetricsProcessor(
 	ctx context.Context,
-	params component.ProcessorCreateSettings,
-	cfg config.Processor,
+	params processor.Settings,
+	cfg component.Config,
 	nextMetricsConsumer consumer.Metrics,
-) (component.MetricsProcessor, error) {
+) (processor.Metrics, error) {
 	return createMetricsProcessorWithOptions(ctx, params, cfg, nextMetricsConsumer)
 }
 
+func createProfilesProcessor(
+	ctx context.Context,
+	params processor.Settings,
+	cfg component.Config,
+	nextProfilesConsumer xconsumer.Profiles,
+) (xprocessor.Profiles, error) {
+	return createProfilesProcessorWithOptions(ctx, params, cfg, nextProfilesConsumer)
+}
+
 func createTracesProcessorWithOptions(
-	_ context.Context,
-	params component.ProcessorCreateSettings,
-	cfg config.Processor,
+	ctx context.Context,
+	set processor.Settings,
+	cfg component.Config,
 	next consumer.Traces,
 	options ...option,
-) (component.TracesProcessor, error) {
-	kp, err := createKubernetesProcessor(params, cfg, options...)
-	if err != nil {
-		return nil, err
-	}
+) (processor.Traces, error) {
+	kp := createKubernetesProcessor(set, cfg, options...)
 
-	return processorhelper.NewTracesProcessor(
+	return processorhelper.NewTraces(
+		ctx,
+		set,
 		cfg,
 		next,
 		kp.processTraces,
@@ -106,18 +106,17 @@ func createTracesProcessorWithOptions(
 }
 
 func createMetricsProcessorWithOptions(
-	_ context.Context,
-	params component.ProcessorCreateSettings,
-	cfg config.Processor,
+	ctx context.Context,
+	set processor.Settings,
+	cfg component.Config,
 	nextMetricsConsumer consumer.Metrics,
 	options ...option,
-) (component.MetricsProcessor, error) {
-	kp, err := createKubernetesProcessor(params, cfg, options...)
-	if err != nil {
-		return nil, err
-	}
+) (processor.Metrics, error) {
+	kp := createKubernetesProcessor(set, cfg, options...)
 
-	return processorhelper.NewMetricsProcessor(
+	return processorhelper.NewMetrics(
+		ctx,
+		set,
 		cfg,
 		nextMetricsConsumer,
 		kp.processMetrics,
@@ -127,18 +126,17 @@ func createMetricsProcessorWithOptions(
 }
 
 func createLogsProcessorWithOptions(
-	_ context.Context,
-	params component.ProcessorCreateSettings,
-	cfg config.Processor,
+	ctx context.Context,
+	set processor.Settings,
+	cfg component.Config,
 	nextLogsConsumer consumer.Logs,
 	options ...option,
-) (component.LogsProcessor, error) {
-	kp, err := createKubernetesProcessor(params, cfg, options...)
-	if err != nil {
-		return nil, err
-	}
+) (processor.Logs, error) {
+	kp := createKubernetesProcessor(set, cfg, options...)
 
-	return processorhelper.NewLogsProcessor(
+	return processorhelper.NewLogs(
+		ctx,
+		set,
 		cfg,
 		nextLogsConsumer,
 		kp.processLogs,
@@ -147,42 +145,45 @@ func createLogsProcessorWithOptions(
 		processorhelper.WithShutdown(kp.Shutdown))
 }
 
-func createKubernetesProcessor(
-	params component.ProcessorCreateSettings,
-	cfg config.Processor,
+func createProfilesProcessorWithOptions(
+	ctx context.Context,
+	set processor.Settings,
+	cfg component.Config,
+	nextProfilesConsumer xconsumer.Profiles,
 	options ...option,
-) (*kubernetesprocessor, error) {
-	kp := &kubernetesprocessor{logger: params.Logger}
+) (xprocessor.Profiles, error) {
+	kp := createKubernetesProcessor(set, cfg, options...)
 
-	warnDeprecatedMetadataConfig(kp.logger, cfg)
-
-	err := errWrongKeyConfig(cfg)
-	if err != nil {
-		return nil, err
-	}
-
-	allOptions := append(createProcessorOpts(cfg), options...)
-
-	for _, opt := range allOptions {
-		if err := opt(kp); err != nil {
-			return nil, err
-		}
-	}
-
-	// This might have been set by an option already
-	if kp.kc == nil {
-		err := kp.initKubeClient(kp.logger, kubeClientProvider)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	return kp, nil
+	return xprocessorhelper.NewProfiles(
+		ctx,
+		set,
+		cfg,
+		nextProfilesConsumer,
+		kp.processProfiles,
+		xprocessorhelper.WithCapabilities(consumerCapabilities),
+		xprocessorhelper.WithStart(kp.Start),
+		xprocessorhelper.WithShutdown(kp.Shutdown),
+	)
 }
 
-func createProcessorOpts(cfg config.Processor) []option {
+func createKubernetesProcessor(
+	params processor.Settings,
+	cfg component.Config,
+	options ...option,
+) *kubernetesprocessor {
+	kp := &kubernetesprocessor{
+		logger:            params.Logger,
+		cfg:               cfg,
+		options:           options,
+		telemetrySettings: params.TelemetrySettings,
+	}
+
+	return kp
+}
+
+func createProcessorOpts(cfg component.Config) []option {
 	oCfg := cfg.(*Config)
-	opts := []option{}
+	var opts []option
 	if oCfg.Passthrough {
 		opts = append(opts, withPassthrough())
 	}
@@ -203,50 +204,10 @@ func createProcessorOpts(cfg config.Processor) []option {
 
 	opts = append(opts, withExcludes(oCfg.Exclude))
 
+	opts = append(opts, withWaitForMetadataTimeout(oCfg.WaitForMetadataTimeout))
+	if oCfg.WaitForMetadata {
+		opts = append(opts, withWaitForMetadata(true))
+	}
+
 	return opts
-}
-
-func warnDeprecatedMetadataConfig(logger *zap.Logger, cfg config.Processor) {
-	oCfg := cfg.(*Config)
-	for _, field := range oCfg.Extract.Metadata {
-		var oldName, newName string
-		switch field {
-		case metdataNamespace:
-			oldName = metdataNamespace
-			newName = conventions.AttributeK8SNamespaceName
-		case metadataPodName:
-			oldName = metadataPodName
-			newName = conventions.AttributeK8SPodName
-		case metadataPodUID:
-			oldName = metadataPodUID
-			newName = conventions.AttributeK8SPodUID
-		case metadataStartTime:
-			oldName = metadataStartTime
-			newName = metadataPodStartTime
-		case metadataDeployment:
-			oldName = metadataDeployment
-			newName = conventions.AttributeK8SDeploymentName
-		case metadataCluster:
-			oldName = metadataCluster
-			newName = conventions.AttributeK8SClusterName
-		case metadataNode:
-			oldName = metadataNode
-			newName = conventions.AttributeK8SNodeName
-		}
-		if oldName != "" {
-			logger.Warn(fmt.Sprintf("%s has been deprecated in favor of %s for k8s-tagger processor", oldName, newName))
-		}
-	}
-}
-
-func errWrongKeyConfig(cfg config.Processor) error {
-	oCfg := cfg.(*Config)
-
-	for _, r := range append(oCfg.Extract.Labels, oCfg.Extract.Annotations...) {
-		if r.Key != "" && r.KeyRegex != "" {
-			return fmt.Errorf("Out of Key or KeyRegex only one option is expected to be configured at a time, currently Key:%s and KeyRegex:%s", r.Key, r.KeyRegex)
-		}
-	}
-
-	return nil
 }

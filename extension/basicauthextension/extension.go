@@ -1,16 +1,5 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//       http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
 package basicauthextension // import "github.com/open-telemetry/opentelemetry-collector-contrib/extension/basicauthextension"
 
@@ -20,17 +9,18 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"strings"
 
 	"github.com/tg123/go-htpasswd"
 	"go.opentelemetry.io/collector/client"
 	"go.opentelemetry.io/collector/component"
-	"go.opentelemetry.io/collector/config/configauth"
+	"go.opentelemetry.io/collector/extension/auth"
+	creds "google.golang.org/grpc/credentials"
 )
 
 var (
-	errNoCredentialSource  = errors.New("no credential source provided")
 	errNoAuth              = errors.New("no basic auth provided")
 	errInvalidCredentials  = errors.New("invalid credentials")
 	errInvalidSchemePrefix = errors.New("invalid authorization scheme prefix")
@@ -38,21 +28,36 @@ var (
 )
 
 type basicAuth struct {
-	htpasswd  HtpasswdSettings
-	matchFunc func(username, password string) bool
+	htpasswd   *HtpasswdSettings
+	clientAuth *ClientAuthSettings
+	matchFunc  func(username, password string) bool
 }
 
-func newExtension(cfg *Config) (configauth.ServerAuthenticator, error) {
-	if cfg.Htpasswd.File == "" && cfg.Htpasswd.Inline == "" {
+func newClientAuthExtension(cfg *Config) auth.Client {
+	ba := basicAuth{
+		clientAuth: cfg.ClientAuth,
+	}
+	return auth.NewClient(
+		auth.WithClientRoundTripper(ba.roundTripper),
+		auth.WithClientPerRPCCredentials(ba.perRPCCredentials),
+	)
+}
+
+func newServerAuthExtension(cfg *Config) (auth.Server, error) {
+	if cfg.Htpasswd == nil || (cfg.Htpasswd.File == "" && cfg.Htpasswd.Inline == "") {
 		return nil, errNoCredentialSource
 	}
+
 	ba := basicAuth{
 		htpasswd: cfg.Htpasswd,
 	}
-	return configauth.NewServerAuthenticator(configauth.WithStart(ba.start), configauth.WithAuthenticate(ba.authenticate)), nil
+	return auth.NewServer(
+		auth.WithServerStart(ba.serverStart),
+		auth.WithServerAuthenticate(ba.authenticate),
+	), nil
 }
 
-func (ba *basicAuth) start(ctx context.Context, host component.Host) error {
+func (ba *basicAuth) serverStart(_ context.Context, _ component.Host) error {
 	var rs []io.Reader
 
 	if ba.htpasswd.File != "" {
@@ -163,7 +168,7 @@ type authData struct {
 	raw      string
 }
 
-func (a *authData) GetAttribute(name string) interface{} {
+func (a *authData) GetAttribute(name string) any {
 	switch name {
 	case "username":
 		return a.username
@@ -176,4 +181,52 @@ func (a *authData) GetAttribute(name string) interface{} {
 
 func (*authData) GetAttributeNames() []string {
 	return []string{"username", "raw"}
+}
+
+// perRPCAuth is a gRPC credentials.PerRPCCredentials implementation that returns an 'authorization' header.
+type perRPCAuth struct {
+	metadata map[string]string
+}
+
+// GetRequestMetadata returns the request metadata to be used with the RPC.
+func (p *perRPCAuth) GetRequestMetadata(context.Context, ...string) (map[string]string, error) {
+	return p.metadata, nil
+}
+
+// RequireTransportSecurity always returns true for this implementation.
+func (p *perRPCAuth) RequireTransportSecurity() bool {
+	return true
+}
+
+type basicAuthRoundTripper struct {
+	base     http.RoundTripper
+	authData *ClientAuthSettings
+}
+
+func (b *basicAuthRoundTripper) RoundTrip(request *http.Request) (*http.Response, error) {
+	newRequest := request.Clone(request.Context())
+	newRequest.SetBasicAuth(b.authData.Username, string(b.authData.Password))
+	return b.base.RoundTrip(newRequest)
+}
+
+func (ba *basicAuth) roundTripper(base http.RoundTripper) (http.RoundTripper, error) {
+	if strings.Contains(ba.clientAuth.Username, ":") {
+		return nil, errInvalidFormat
+	}
+	return &basicAuthRoundTripper{
+		base:     base,
+		authData: ba.clientAuth,
+	}, nil
+}
+
+func (ba *basicAuth) perRPCCredentials() (creds.PerRPCCredentials, error) {
+	if strings.Contains(ba.clientAuth.Username, ":") {
+		return nil, errInvalidFormat
+	}
+	encoded := base64.StdEncoding.EncodeToString([]byte(ba.clientAuth.Username + ":" + string(ba.clientAuth.Password)))
+	return &perRPCAuth{
+		metadata: map[string]string{
+			"authorization": fmt.Sprintf("Basic %s", encoded),
+		},
+	}, nil
 }

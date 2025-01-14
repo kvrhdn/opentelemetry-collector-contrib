@@ -1,16 +1,5 @@
-// Copyright 2020, OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
 
 package kubelet
 
@@ -20,12 +9,15 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/collector/receiver/receivertest"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"go.uber.org/zap/zaptest/observer"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	stats "k8s.io/kubelet/pkg/apis/stats/v1alpha1"
+
+	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/kubeletstatsreceiver/internal/metadata"
 )
 
 // TestMetadataErrorCases walks through the error cases of collecting
@@ -39,7 +31,7 @@ func TestMetadataErrorCases(t *testing.T) {
 		numMDs                          int
 		numLogs                         int
 		logMessages                     []string
-		detailedPVCLabelsSetterOverride func(volCacheID, volumeClaim, namespace string, labels map[string]string) error
+		detailedPVCLabelsSetterOverride func(rb *metadata.ResourceBuilder, volCacheID, volumeClaim, namespace string) error
 	}{
 		{
 			name: "Fails to get container metadata",
@@ -52,18 +44,16 @@ func TestMetadataErrorCases(t *testing.T) {
 						ObjectMeta: metav1.ObjectMeta{
 							UID: "pod-uid-123",
 						},
-						Status: v1.PodStatus{
-							ContainerStatuses: []v1.ContainerStatus{
+						Spec: v1.PodSpec{
+							Containers: []v1.Container{
 								{
-									// different container name
-									Name:        "container2",
-									ContainerID: "test-container",
+									Name: "container2",
 								},
 							},
 						},
 					},
 				},
-			}, nil),
+			}, NodeCapacity{}, nil),
 			testScenario: func(acc metricDataAccumulator) {
 				now := metav1.Now()
 				podStats := stats.PodStats{
@@ -89,7 +79,7 @@ func TestMetadataErrorCases(t *testing.T) {
 			metricGroupsToCollect: map[MetricGroup]bool{
 				VolumeMetricGroup: true,
 			},
-			metadata: NewMetadata([]MetadataLabel{MetadataLabelVolumeType}, nil, nil),
+			metadata: NewMetadata([]MetadataLabel{MetadataLabelVolumeType}, nil, NodeCapacity{}, nil),
 			testScenario: func(acc metricDataAccumulator) {
 				podStats := stats.PodStats{
 					PodRef: stats.PodReference{
@@ -131,7 +121,7 @@ func TestMetadataErrorCases(t *testing.T) {
 						},
 					},
 				},
-			}, nil),
+			}, NodeCapacity{}, nil),
 			testScenario: func(acc metricDataAccumulator) {
 				podStats := stats.PodStats{
 					PodRef: stats.PodReference{
@@ -175,8 +165,8 @@ func TestMetadataErrorCases(t *testing.T) {
 						},
 					},
 				},
-			}, nil),
-			detailedPVCLabelsSetterOverride: func(volCacheID, volumeClaim, namespace string, labels map[string]string) error {
+			}, NodeCapacity{}, nil),
+			detailedPVCLabelsSetterOverride: func(*metadata.ResourceBuilder, string, string, string) error {
 				// Mock failure cases.
 				return errors.New("")
 			},
@@ -205,16 +195,22 @@ func TestMetadataErrorCases(t *testing.T) {
 			observedLogger, logs := observer.New(zapcore.WarnLevel)
 			logger := zap.New(observedLogger)
 
-			tt.metadata.DetailedPVCLabelsSetter = tt.detailedPVCLabelsSetterOverride
+			tt.metadata.DetailedPVCResourceSetter = tt.detailedPVCLabelsSetterOverride
 			acc := metricDataAccumulator{
 				metadata:              tt.metadata,
 				logger:                logger,
 				metricGroupsToCollect: tt.metricGroupsToCollect,
+				mbs: &metadata.MetricsBuilders{
+					NodeMetricsBuilder:      metadata.NewMetricsBuilder(metadata.DefaultMetricsBuilderConfig(), receivertest.NewNopSettings()),
+					PodMetricsBuilder:       metadata.NewMetricsBuilder(metadata.DefaultMetricsBuilderConfig(), receivertest.NewNopSettings()),
+					ContainerMetricsBuilder: metadata.NewMetricsBuilder(metadata.DefaultMetricsBuilderConfig(), receivertest.NewNopSettings()),
+					OtherMetricsBuilder:     metadata.NewMetricsBuilder(metadata.DefaultMetricsBuilderConfig(), receivertest.NewNopSettings()),
+				},
 			}
 
 			tt.testScenario(acc)
 
-			assert.Equal(t, tt.numMDs, len(acc.m))
+			assert.Len(t, acc.m, tt.numMDs)
 			require.Equal(t, tt.numLogs, logs.Len())
 			for i := 0; i < tt.numLogs; i++ {
 				assert.Equal(t, tt.logMessages[i], logs.All()[i].Message)
@@ -230,6 +226,12 @@ func TestNilHandling(t *testing.T) {
 			NodeMetricGroup:      true,
 			ContainerMetricGroup: true,
 			VolumeMetricGroup:    true,
+		},
+		mbs: &metadata.MetricsBuilders{
+			NodeMetricsBuilder:      metadata.NewMetricsBuilder(metadata.DefaultMetricsBuilderConfig(), receivertest.NewNopSettings()),
+			PodMetricsBuilder:       metadata.NewMetricsBuilder(metadata.DefaultMetricsBuilderConfig(), receivertest.NewNopSettings()),
+			ContainerMetricsBuilder: metadata.NewMetricsBuilder(metadata.DefaultMetricsBuilderConfig(), receivertest.NewNopSettings()),
+			OtherMetricsBuilder:     metadata.NewMetricsBuilder(metadata.DefaultMetricsBuilderConfig(), receivertest.NewNopSettings()),
 		},
 	}
 	assert.NotPanics(t, func() {

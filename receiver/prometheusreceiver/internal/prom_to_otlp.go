@@ -1,24 +1,27 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//       http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
 package internal // import "github.com/open-telemetry/opentelemetry-collector-contrib/receiver/prometheusreceiver/internal"
 
 import (
 	"net"
 
-	"go.opentelemetry.io/collector/model/pdata"
-	conventions "go.opentelemetry.io/collector/model/semconv/v1.5.0"
+	"github.com/prometheus/common/model"
+	"github.com/prometheus/prometheus/model/labels"
+	"go.opentelemetry.io/collector/featuregate"
+	"go.opentelemetry.io/collector/pdata/pcommon"
+	conventions "go.opentelemetry.io/collector/semconv/v1.25.0"
+	oldconventions "go.opentelemetry.io/collector/semconv/v1.6.1"
+)
+
+const removeOldSemconvFeatureGateID = "receiver.prometheusreceiver.RemoveLegacyResourceAttributes"
+
+var removeOldSemconvFeatureGate = featuregate.GlobalRegistry().MustRegister(
+	removeOldSemconvFeatureGateID,
+	featuregate.StageAlpha,
+	featuregate.WithRegisterFromVersion("v0.101.0"),
+	featuregate.WithRegisterDescription("When enabled, the net.host.name, net.host.port, and http.scheme resource attributes are no longer added to metrics. Use server.address, server.port, and url.scheme instead."),
+	featuregate.WithRegisterReferenceURL("https://github.com/open-telemetry/opentelemetry-collector-contrib/issues/32814"),
 )
 
 // isDiscernibleHost checks if a host can be used as a value for the 'host.name' key.
@@ -40,22 +43,70 @@ func isDiscernibleHost(host string) bool {
 	return true
 }
 
-// CreateNodeAndResourcePdata creates the resource data added to OTLP payloads.
-func CreateNodeAndResourcePdata(job, instance, scheme string) *pdata.Resource {
+// CreateResource creates the resource data added to OTLP payloads.
+func CreateResource(job, instance string, serviceDiscoveryLabels labels.Labels) pcommon.Resource {
 	host, port, err := net.SplitHostPort(instance)
 	if err != nil {
 		host = instance
 	}
-	resource := pdata.NewResource()
+	resource := pcommon.NewResource()
 	attrs := resource.Attributes()
-	attrs.UpsertString(conventions.AttributeServiceName, job)
+	attrs.PutStr(conventions.AttributeServiceName, job)
 	if isDiscernibleHost(host) {
-		attrs.UpsertString(conventions.AttributeHostName, host)
+		if !removeOldSemconvFeatureGate.IsEnabled() {
+			attrs.PutStr(oldconventions.AttributeNetHostName, host)
+		}
+		attrs.PutStr(conventions.AttributeServerAddress, host)
 	}
-	attrs.UpsertString(jobAttr, job)
-	attrs.UpsertString(instanceAttr, instance)
-	attrs.UpsertString(portAttr, port)
-	attrs.UpsertString(schemeAttr, scheme)
+	attrs.PutStr(conventions.AttributeServiceInstanceID, instance)
+	if !removeOldSemconvFeatureGate.IsEnabled() {
+		attrs.PutStr(conventions.AttributeNetHostPort, port)
+		attrs.PutStr(conventions.AttributeHTTPScheme, serviceDiscoveryLabels.Get(model.SchemeLabel))
+	}
+	attrs.PutStr(conventions.AttributeServerPort, port)
+	attrs.PutStr(conventions.AttributeURLScheme, serviceDiscoveryLabels.Get(model.SchemeLabel))
 
-	return &resource
+	addKubernetesResource(attrs, serviceDiscoveryLabels)
+
+	return resource
+}
+
+// kubernetesDiscoveryToResourceAttributes maps from metadata labels discovered
+// through the kubernetes implementation of service discovery to opentelemetry
+// resource attribute keys.
+var kubernetesDiscoveryToResourceAttributes = map[string]string{
+	"__meta_kubernetes_pod_name":           conventions.AttributeK8SPodName,
+	"__meta_kubernetes_pod_uid":            conventions.AttributeK8SPodUID,
+	"__meta_kubernetes_pod_container_name": conventions.AttributeK8SContainerName,
+	"__meta_kubernetes_namespace":          conventions.AttributeK8SNamespaceName,
+	// Only one of the node name service discovery labels will be present
+	"__meta_kubernetes_pod_node_name":      conventions.AttributeK8SNodeName,
+	"__meta_kubernetes_node_name":          conventions.AttributeK8SNodeName,
+	"__meta_kubernetes_endpoint_node_name": conventions.AttributeK8SNodeName,
+}
+
+// addKubernetesResource adds resource information detected by prometheus'
+// kubernetes service discovery.
+func addKubernetesResource(attrs pcommon.Map, serviceDiscoveryLabels labels.Labels) {
+	for sdKey, attributeKey := range kubernetesDiscoveryToResourceAttributes {
+		if attr := serviceDiscoveryLabels.Get(sdKey); attr != "" {
+			attrs.PutStr(attributeKey, attr)
+		}
+	}
+	controllerName := serviceDiscoveryLabels.Get("__meta_kubernetes_pod_controller_name")
+	controllerKind := serviceDiscoveryLabels.Get("__meta_kubernetes_pod_controller_kind")
+	if controllerKind != "" && controllerName != "" {
+		switch controllerKind {
+		case "ReplicaSet":
+			attrs.PutStr(conventions.AttributeK8SReplicaSetName, controllerName)
+		case "DaemonSet":
+			attrs.PutStr(conventions.AttributeK8SDaemonSetName, controllerName)
+		case "StatefulSet":
+			attrs.PutStr(conventions.AttributeK8SStatefulSetName, controllerName)
+		case "Job":
+			attrs.PutStr(conventions.AttributeK8SJobName, controllerName)
+		case "CronJob":
+			attrs.PutStr(conventions.AttributeK8SCronJobName, controllerName)
+		}
+	}
 }

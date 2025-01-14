@@ -1,16 +1,5 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
 package oauth2clientauthextension // import "github.com/open-telemetry/opentelemetry-collector-contrib/extension/oauth2clientauthextension"
 
@@ -19,8 +8,6 @@ import (
 	"fmt"
 	"net/http"
 
-	"go.opentelemetry.io/collector/component"
-	"go.opentelemetry.io/collector/config/configauth"
 	"go.uber.org/multierr"
 	"go.uber.org/zap"
 	"golang.org/x/oauth2"
@@ -29,16 +16,13 @@ import (
 	grpcOAuth "google.golang.org/grpc/credentials/oauth"
 )
 
-// ClientCredentialsAuthenticator provides implementation for providing client authentication using OAuth2 client credentials
+// clientAuthenticator provides implementation for providing client authentication using OAuth2 client credentials
 // workflow for both gRPC and HTTP clients.
-type ClientCredentialsAuthenticator struct {
-	clientCredentials *clientcredentials.Config
+type clientAuthenticator struct {
+	clientCredentials *clientCredentialsConfig
 	logger            *zap.Logger
 	client            *http.Client
 }
-
-// ClientCredentialsAuthenticator implements ClientAuthenticator
-var _ configauth.ClientAuthenticator = (*ClientCredentialsAuthenticator)(nil)
 
 type errorWrappingTokenSource struct {
 	ts       oauth2.TokenSource
@@ -51,31 +35,26 @@ var _ oauth2.TokenSource = (*errorWrappingTokenSource)(nil)
 // errFailedToGetSecurityToken indicates a problem communicating with OAuth2 server.
 var errFailedToGetSecurityToken = fmt.Errorf("failed to get security token from token endpoint")
 
-func newClientCredentialsExtension(cfg *Config, logger *zap.Logger) (*ClientCredentialsAuthenticator, error) {
-	if cfg.ClientID == "" {
-		return nil, errNoClientIDProvided
-	}
-	if cfg.ClientSecret == "" {
-		return nil, errNoClientSecretProvided
-	}
-	if cfg.TokenURL == "" {
-		return nil, errNoTokenURLProvided
-	}
-
+func newClientAuthenticator(cfg *Config, logger *zap.Logger) (*clientAuthenticator, error) {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 
-	tlsCfg, err := cfg.TLSSetting.LoadTLSConfig()
+	tlsCfg, err := cfg.TLSSetting.LoadTLSConfig(context.Background())
 	if err != nil {
 		return nil, err
 	}
 	transport.TLSClientConfig = tlsCfg
 
-	return &ClientCredentialsAuthenticator{
-		clientCredentials: &clientcredentials.Config{
-			ClientID:     cfg.ClientID,
-			ClientSecret: cfg.ClientSecret,
-			TokenURL:     cfg.TokenURL,
-			Scopes:       cfg.Scopes,
+	return &clientAuthenticator{
+		clientCredentials: &clientCredentialsConfig{
+			Config: clientcredentials.Config{
+				ClientID:       cfg.ClientID,
+				ClientSecret:   string(cfg.ClientSecret),
+				TokenURL:       cfg.TokenURL,
+				Scopes:         cfg.Scopes,
+				EndpointParams: cfg.EndpointParams,
+			},
+			ClientIDFile:     cfg.ClientIDFile,
+			ClientSecretFile: cfg.ClientSecretFile,
 		},
 		logger: logger,
 		client: &http.Client{
@@ -83,16 +62,6 @@ func newClientCredentialsExtension(cfg *Config, logger *zap.Logger) (*ClientCred
 			Timeout:   cfg.Timeout,
 		},
 	}, nil
-}
-
-// Start for ClientCredentialsAuthenticator extension does nothing
-func (o *ClientCredentialsAuthenticator) Start(_ context.Context, _ component.Host) error {
-	return nil
-}
-
-// Shutdown for ClientCredentialsAuthenticator extension does nothing
-func (o *ClientCredentialsAuthenticator) Shutdown(_ context.Context) error {
-	return nil
 }
 
 func (ewts errorWrappingTokenSource) Token() (*oauth2.Token, error) {
@@ -105,9 +74,9 @@ func (ewts errorWrappingTokenSource) Token() (*oauth2.Token, error) {
 	return tok, nil
 }
 
-// RoundTripper returns oauth2.Transport, an http.RoundTripper that performs "client-credential" OAuth flow and
+// roundTripper returns oauth2.Transport, an http.RoundTripper that performs "client-credential" OAuth flow and
 // also auto refreshes OAuth tokens as needed.
-func (o *ClientCredentialsAuthenticator) RoundTripper(base http.RoundTripper) (http.RoundTripper, error) {
+func (o *clientAuthenticator) roundTripper(base http.RoundTripper) (http.RoundTripper, error) {
 	ctx := context.WithValue(context.Background(), oauth2.HTTPClient, o.client)
 	return &oauth2.Transport{
 		Source: errorWrappingTokenSource{
@@ -118,9 +87,9 @@ func (o *ClientCredentialsAuthenticator) RoundTripper(base http.RoundTripper) (h
 	}, nil
 }
 
-// PerRPCCredentials returns gRPC PerRPCCredentials that supports "client-credential" OAuth flow. The underneath
+// perRPCCredentials returns gRPC PerRPCCredentials that supports "client-credential" OAuth flow. The underneath
 // oauth2.clientcredentials.Config instance will manage tokens performing auto refresh as necessary.
-func (o *ClientCredentialsAuthenticator) PerRPCCredentials() (credentials.PerRPCCredentials, error) {
+func (o *clientAuthenticator) perRPCCredentials() (credentials.PerRPCCredentials, error) {
 	ctx := context.WithValue(context.Background(), oauth2.HTTPClient, o.client)
 	return grpcOAuth.TokenSource{
 		TokenSource: errorWrappingTokenSource{

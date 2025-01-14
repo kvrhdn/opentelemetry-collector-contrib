@@ -1,28 +1,21 @@
-// Copyright  The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
 
 package kafkametricsreceiver // import "github.com/open-telemetry/opentelemetry-collector-contrib/receiver/kafkametricsreceiver"
 
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"time"
 
-	"github.com/Shopify/sarama"
+	"github.com/IBM/sarama"
 	"go.opentelemetry.io/collector/component"
-	"go.opentelemetry.io/collector/model/pdata"
-	"go.opentelemetry.io/collector/receiver/scraperhelper"
+	"go.opentelemetry.io/collector/pdata/pcommon"
+	"go.opentelemetry.io/collector/pdata/pmetric"
+	"go.opentelemetry.io/collector/receiver"
+	"go.opentelemetry.io/collector/scraper"
+	"go.opentelemetry.io/collector/scraper/scrapererror"
 	"go.uber.org/zap"
 
 	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/kafkametricsreceiver/internal/metadata"
@@ -30,52 +23,96 @@ import (
 
 type brokerScraper struct {
 	client       sarama.Client
-	logger       *zap.Logger
+	settings     receiver.Settings
 	config       Config
 	saramaConfig *sarama.Config
+	clusterAdmin sarama.ClusterAdmin
+	mb           *metadata.MetricsBuilder
 }
 
-func (s *brokerScraper) Name() string {
-	return brokersScraperName
-}
+const (
+	logRetentionHours = "log.retention.hours"
+)
 
-func (s *brokerScraper) start(context.Context, component.Host) error {
-	client, err := newSaramaClient(s.config.Brokers, s.saramaConfig)
-	if err != nil {
-		return fmt.Errorf("failed to create client while starting brokers scraper: %w", err)
-	}
-	s.client = client
+func (s *brokerScraper) start(_ context.Context, _ component.Host) error {
+	s.mb = metadata.NewMetricsBuilder(s.config.MetricsBuilderConfig, s.settings)
 	return nil
 }
 
 func (s *brokerScraper) shutdown(context.Context) error {
-	if !s.client.Closed() {
+	if s.client != nil && !s.client.Closed() {
 		return s.client.Close()
 	}
 	return nil
 }
 
-func (s *brokerScraper) scrape(context.Context) (pdata.Metrics, error) {
+func (s *brokerScraper) scrape(context.Context) (pmetric.Metrics, error) {
+	scrapeErrors := scrapererror.ScrapeErrors{}
+
+	if s.client == nil {
+		client, err := newSaramaClient(s.config.Brokers, s.saramaConfig)
+		if err != nil {
+			return pmetric.Metrics{}, fmt.Errorf("failed to create client in brokers scraper: %w", err)
+		}
+		s.client = client
+	}
+
+	now := pcommon.NewTimestampFromTime(time.Now())
+	rb := s.mb.NewResourceBuilder()
+	rb.SetKafkaClusterAlias(s.config.ClusterAlias)
+
 	brokers := s.client.Brokers()
+	s.mb.RecordKafkaBrokersDataPoint(now, int64(len(brokers)))
+	if !s.config.Metrics.KafkaBrokerLogRetentionPeriod.Enabled {
+		return s.mb.Emit(metadata.WithResource(rb.Emit())), scrapeErrors.Combine()
+	}
 
-	md := pdata.NewMetrics()
-	ilm := md.ResourceMetrics().AppendEmpty().InstrumentationLibraryMetrics().AppendEmpty()
-	ilm.InstrumentationLibrary().SetName(instrumentationLibName)
-	addIntGauge(ilm.Metrics(), metadata.M.KafkaBrokers.Name(), pdata.NewTimestampFromTime(time.Now()), pdata.NewAttributeMap(), int64(len(brokers)))
+	if s.clusterAdmin == nil {
+		admin, err := newClusterAdmin(s.config.Brokers, s.saramaConfig)
+		if err != nil {
+			s.settings.Logger.Error("Error creating kafka client with admin privileges", zap.Error(err))
+			return s.mb.Emit(metadata.WithResource(rb.Emit())), scrapeErrors.Combine()
+		}
+		s.clusterAdmin = admin
+	}
 
-	return md, nil
+	for _, broker := range brokers {
+		id := strconv.Itoa(int(broker.ID()))
+		configEntries, err := s.clusterAdmin.DescribeConfig(sarama.ConfigResource{
+			Type:        sarama.BrokerResource,
+			Name:        id,
+			ConfigNames: []string{logRetentionHours},
+		})
+		if err != nil {
+			scrapeErrors.AddPartial(1, fmt.Errorf("failed to fetch the `%s` metric from %s: %w", logRetentionHours, broker.Addr(), err))
+			continue
+		}
+		for _, config := range configEntries {
+			if config.Name != logRetentionHours {
+				continue
+			}
+			val, err := strconv.Atoi(config.Value)
+			if err != nil {
+				scrapeErrors.AddPartial(1, fmt.Errorf("error converting `%s` for %s: value was %s", logRetentionHours, broker.Addr(), config.Value))
+			}
+			s.mb.RecordKafkaBrokerLogRetentionPeriodDataPoint(now, int64(val*3600), id)
+		}
+	}
+
+	return s.mb.Emit(metadata.WithResource(rb.Emit())), scrapeErrors.Combine()
 }
 
-func createBrokerScraper(_ context.Context, cfg Config, saramaConfig *sarama.Config, logger *zap.Logger) (scraperhelper.Scraper, error) {
+func createBrokerScraper(_ context.Context, cfg Config, saramaConfig *sarama.Config,
+	settings receiver.Settings,
+) (scraper.Metrics, error) {
 	s := brokerScraper{
-		logger:       logger,
+		settings:     settings,
 		config:       cfg,
 		saramaConfig: saramaConfig,
 	}
-	return scraperhelper.NewScraper(
-		s.Name(),
+	return scraper.NewMetrics(
 		s.scrape,
-		scraperhelper.WithShutdown(s.shutdown),
-		scraperhelper.WithStart(s.start),
+		scraper.WithStart(s.start),
+		scraper.WithShutdown(s.shutdown),
 	)
 }

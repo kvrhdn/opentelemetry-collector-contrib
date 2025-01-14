@@ -1,30 +1,22 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
 // Package sapmexporter exports trace data using Splunk's SAPM protocol.
 package sapmexporter // import "github.com/open-telemetry/opentelemetry-collector-contrib/exporter/sapmexporter"
 
 import (
 	"context"
+	"errors"
 
 	"github.com/jaegertracing/jaeger/model"
 	sapmclient "github.com/signalfx/sapm-proto/client"
+	"go.opentelemetry.io/collector/client"
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/consumer"
 	"go.opentelemetry.io/collector/consumer/consumererror"
+	"go.opentelemetry.io/collector/exporter"
 	"go.opentelemetry.io/collector/exporter/exporterhelper"
-	"go.opentelemetry.io/collector/model/pdata"
+	"go.opentelemetry.io/collector/pdata/ptrace"
 	"go.uber.org/zap"
 
 	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/splunk"
@@ -50,12 +42,7 @@ func (se *sapmExporter) Shutdown(context.Context) error {
 	return nil
 }
 
-func newSAPMExporter(cfg *Config, params component.ExporterCreateSettings) (sapmExporter, error) {
-	err := cfg.validate()
-	if err != nil {
-		return sapmExporter{}, err
-	}
-
+func newSAPMExporter(cfg *Config, params exporter.Settings) (sapmExporter, error) {
 	client, err := sapmclient.New(cfg.clientOptions()...)
 	if err != nil {
 		return sapmExporter{}, err
@@ -68,22 +55,22 @@ func newSAPMExporter(cfg *Config, params component.ExporterCreateSettings) (sapm
 	}, err
 }
 
-func newSAPMTracesExporter(cfg *Config, set component.ExporterCreateSettings) (component.TracesExporter, error) {
+func newSAPMTracesExporter(cfg *Config, set exporter.Settings) (exporter.Traces, error) {
 	se, err := newSAPMExporter(cfg, set)
 	if err != nil {
 		return nil, err
 	}
 
-	te, err := exporterhelper.NewTracesExporter(
-		cfg,
+	te, err := exporterhelper.NewTraces(
+		context.TODO(),
 		set,
+		cfg,
 		se.pushTraceData,
 		exporterhelper.WithShutdown(se.Shutdown),
 		exporterhelper.WithQueue(cfg.QueueSettings),
-		exporterhelper.WithRetry(cfg.RetrySettings),
+		exporterhelper.WithRetry(cfg.BackOffConfig),
 		exporterhelper.WithTimeout(cfg.TimeoutSettings),
 	)
-
 	if err != nil {
 		return nil, err
 	}
@@ -101,26 +88,32 @@ func newSAPMTracesExporter(cfg *Config, set component.ExporterCreateSettings) (c
 
 // pushTraceData exports traces in SAPM proto by associated SFx access token and returns number of dropped spans
 // and the last experienced error if any translation or export failed
-func (se *sapmExporter) pushTraceData(ctx context.Context, td pdata.Traces) error {
+func (se *sapmExporter) pushTraceData(ctx context.Context, td ptrace.Traces) error {
 	rss := td.ResourceSpans()
 	if rss.Len() == 0 {
 		return nil
 	}
 
-	// All metrics in the pdata.Metrics will have the same access token because of the BatchPerResourceMetrics.
-	accessToken := se.retrieveAccessToken(rss.At(0))
-	batches, err := jaeger.InternalTracesToJaegerProto(td)
-	if err != nil {
-		return consumererror.NewPermanent(err)
-	}
+	accessToken := se.retrieveAccessToken(ctx, rss.At(0))
+
+	batches := jaeger.ProtoFromTraces(td)
 
 	// Cannot remove the access token from the pdata, because exporters required to not modify incoming pdata,
 	// so need to remove that after conversion.
 	filterToken(batches)
 
-	err = se.client.ExportWithAccessToken(ctx, batches, accessToken)
+	ingestResponse, err := se.client.ExportWithAccessTokenAndGetResponse(ctx, batches, accessToken)
+	if se.config.LogDetailedResponse && ingestResponse != nil {
+		if ingestResponse.Err != nil {
+			se.logger.Error("Failed to get response from trace ingest", zap.Error(ingestResponse.Err))
+		} else {
+			se.logger.Debug("Detailed response from ingest", zap.ByteString("response", ingestResponse.Body))
+		}
+	}
+
 	if err != nil {
-		if sendErr, ok := err.(*sapmclient.ErrSend); ok && sendErr.Permanent {
+		sendErr := &sapmclient.ErrSend{}
+		if errors.As(err, &sendErr) && sendErr.Permanent {
 			return consumererror.NewPermanent(sendErr)
 		}
 		return err
@@ -129,15 +122,21 @@ func (se *sapmExporter) pushTraceData(ctx context.Context, td pdata.Traces) erro
 	return nil
 }
 
-func (se *sapmExporter) retrieveAccessToken(md pdata.ResourceSpans) string {
+func (se *sapmExporter) retrieveAccessToken(ctx context.Context, md ptrace.ResourceSpans) string {
 	if !se.config.AccessTokenPassthrough {
 		// Nothing to do if token is pass through not configured or resource is nil.
 		return ""
 	}
 
+	cl := client.FromContext(ctx)
+	ss := cl.Metadata.Get(splunk.SFxAccessTokenHeader)
+	if len(ss) > 0 {
+		return ss[0]
+	}
+
 	attrs := md.Resource().Attributes()
 	if accessToken, ok := attrs.Get(splunk.SFxAccessTokenLabel); ok {
-		return accessToken.StringVal()
+		return accessToken.Str()
 	}
 	return ""
 }

@@ -1,16 +1,5 @@
-// Copyright  The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
 
 package elasticsearchreceiver
 
@@ -19,10 +8,17 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"go.opentelemetry.io/collector/component/componenttest"
-	"go.opentelemetry.io/collector/config"
-	"go.opentelemetry.io/collector/service/servicetest"
+	"go.opentelemetry.io/collector/component"
+	"go.opentelemetry.io/collector/config/confighttp"
+	"go.opentelemetry.io/collector/config/configopaque"
+	"go.opentelemetry.io/collector/confmap/confmaptest"
+	"go.opentelemetry.io/collector/scraper/scraperhelper"
+
+	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/elasticsearchreceiver/internal/metadata"
 )
 
 func TestValidateCredentials(t *testing.T) {
@@ -37,7 +33,7 @@ func TestValidateCredentials(t *testing.T) {
 
 				cfg := NewFactory().CreateDefaultConfig().(*Config)
 				cfg.Username = "user"
-				require.ErrorIs(t, cfg.Validate(), errPasswordNotSpecified)
+				require.ErrorIs(t, component.ValidateConfig(cfg), errPasswordNotSpecified)
 			},
 		},
 		{
@@ -47,7 +43,7 @@ func TestValidateCredentials(t *testing.T) {
 
 				cfg := NewFactory().CreateDefaultConfig().(*Config)
 				cfg.Password = "pass"
-				require.ErrorIs(t, cfg.Validate(), errUsernameNotSpecified)
+				require.ErrorIs(t, component.ValidateConfig(cfg), errUsernameNotSpecified)
 			},
 		},
 		{
@@ -58,7 +54,7 @@ func TestValidateCredentials(t *testing.T) {
 				cfg := NewFactory().CreateDefaultConfig().(*Config)
 				cfg.Username = "user"
 				cfg.Password = "pass"
-				require.NoError(t, cfg.Validate())
+				require.NoError(t, component.ValidateConfig(cfg))
 			},
 		},
 		{
@@ -67,7 +63,7 @@ func TestValidateCredentials(t *testing.T) {
 				t.Parallel()
 
 				cfg := NewFactory().CreateDefaultConfig().(*Config)
-				require.NoError(t, cfg.Validate())
+				require.NoError(t, component.ValidateConfig(cfg))
 			},
 		},
 	}
@@ -128,14 +124,13 @@ func TestValidateEndpoint(t *testing.T) {
 			cfg := NewFactory().CreateDefaultConfig().(*Config)
 			cfg.Endpoint = testCase.rawURL
 
-			err := cfg.Validate()
+			err := component.ValidateConfig(cfg)
 
 			switch {
 			case testCase.expectedErr != nil:
 				require.ErrorIs(t, err, testCase.expectedErr)
 			case testCase.expectedErrStr != "":
-				require.Error(t, err)
-				require.Contains(t, err.Error(), testCase.expectedErrStr)
+				require.ErrorContains(t, err, testCase.expectedErrStr)
 			default:
 				require.NoError(t, err)
 			}
@@ -146,33 +141,56 @@ func TestValidateEndpoint(t *testing.T) {
 func TestLoadConfig(t *testing.T) {
 	t.Parallel()
 
-	factories, err := componenttest.NopFactories()
+	cm, err := confmaptest.LoadConf(filepath.Join("testdata", "config.yaml"))
 	require.NoError(t, err)
 
-	factory := NewFactory()
-	factories.Receivers[typeStr] = factory
-	cfg, err := servicetest.LoadConfigAndValidate(filepath.Join("testdata", "config.yaml"), factories)
-	require.NoError(t, err)
-	require.NotNil(t, cfg)
+	defaultMetrics := metadata.DefaultMetricsBuilderConfig()
+	defaultMetrics.Metrics.ElasticsearchNodeFsDiskAvailable.Enabled = false
+	tests := []struct {
+		id       component.ID
+		expected component.Config
+	}{
+		{
+			id:       component.NewIDWithName(metadata.Type, "defaults"),
+			expected: createDefaultConfig(),
+		},
+		{
+			id: component.NewIDWithName(metadata.Type, ""),
+			expected: &Config{
+				SkipClusterMetrics: true,
+				Nodes:              []string{"_local"},
+				Indices:            []string{".geoip_databases"},
+				ControllerConfig: scraperhelper.ControllerConfig{
+					CollectionInterval: 2 * time.Minute,
+					InitialDelay:       time.Second,
+				},
+				MetricsBuilderConfig: defaultMetrics,
+				Username:             "otel",
+				Password:             "password",
+				ClientConfig: func() confighttp.ClientConfig {
+					client := confighttp.NewDefaultClientConfig()
+					client.Timeout = 10000000000
+					client.Endpoint = "http://example.com:9200"
+					client.Headers = map[string]configopaque.String{}
+					return client
+				}(),
+			},
+		},
+	}
 
-	require.Equal(t, len(cfg.Receivers), 2)
-	defaultRecvID := config.NewComponentIDWithName(typeStr, "defaults")
+	for _, tt := range tests {
+		t.Run(tt.id.String(), func(t *testing.T) {
+			factory := NewFactory()
+			cfg := factory.CreateDefaultConfig()
 
-	defaultCfg := factory.CreateDefaultConfig().(*Config)
-	defaultCfg.ReceiverSettings.SetIDName(defaultRecvID.Name())
-	defaultReceiver := cfg.Receivers[defaultRecvID]
-	require.Equal(t, defaultCfg, defaultReceiver)
+			sub, err := cm.Sub(tt.id.String())
+			require.NoError(t, err)
+			require.NoError(t, sub.Unmarshal(cfg))
 
-	advancedRecv := cfg.Receivers[config.NewComponentID(typeStr)]
-	expectedAdvancedRecv := factory.CreateDefaultConfig().(*Config)
-
-	expectedAdvancedRecv.Metrics.ElasticsearchNodeFsDiskAvailable.Enabled = false
-	expectedAdvancedRecv.Nodes = []string{"_local"}
-	expectedAdvancedRecv.SkipClusterMetrics = true
-	expectedAdvancedRecv.Username = "otel"
-	expectedAdvancedRecv.Password = "password"
-	expectedAdvancedRecv.Endpoint = "http://example.com:9200"
-	expectedAdvancedRecv.ScraperControllerSettings.CollectionInterval = 2 * time.Minute
-
-	require.Equal(t, expectedAdvancedRecv, advancedRecv)
+			assert.NoError(t, component.ValidateConfig(cfg))
+			if diff := cmp.Diff(tt.expected, cfg, cmpopts.IgnoreUnexported(metadata.MetricConfig{}), cmpopts.IgnoreUnexported(metadata.ResourceAttributeConfig{})); diff != "" {
+				t.Errorf("Config mismatch (-expected +actual):\n%s", diff)
+			}
+		})
+	}
 }

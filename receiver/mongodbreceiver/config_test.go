@@ -1,27 +1,23 @@
-// Copyright  The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
 
 package mongodbreceiver // import "github.com/open-telemetry/opentelemetry-collector-contrib/receiver/mongodbreceiver"
 
 import (
 	"errors"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/config/confignet"
+	"go.opentelemetry.io/collector/config/configopaque"
 	"go.opentelemetry.io/collector/config/configtls"
+	"go.opentelemetry.io/collector/confmap/confmaptest"
+	"go.opentelemetry.io/collector/scraper/scraperhelper"
+
+	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/mongodbreceiver/internal/metadata"
 )
 
 func TestValidate(t *testing.T) {
@@ -80,24 +76,25 @@ func TestValidate(t *testing.T) {
 	}
 	for _, tc := range testCases {
 		t.Run(tc.desc, func(t *testing.T) {
-			hosts := []confignet.NetAddr{}
+			var hosts []confignet.TCPAddrConfig
 
 			for _, ep := range tc.endpoints {
-				hosts = append(hosts, confignet.NetAddr{
+				hosts = append(hosts, confignet.TCPAddrConfig{
 					Endpoint: ep,
 				})
 			}
 
-			cfg := Config{
-				Username: tc.username,
-				Password: tc.password,
-				Hosts:    hosts,
+			cfg := &Config{
+				Username:         tc.username,
+				Password:         configopaque.String(tc.password),
+				Hosts:            hosts,
+				ControllerConfig: scraperhelper.NewDefaultControllerConfig(),
 			}
-			err := cfg.Validate()
+			err := component.ValidateConfig(cfg)
 			if tc.expected == nil {
-				require.Nil(t, err)
+				require.NoError(t, err)
 			} else {
-				require.Contains(t, err.Error(), tc.expected.Error())
+				require.ErrorContains(t, err, tc.expected.Error())
 			}
 		})
 	}
@@ -106,13 +103,13 @@ func TestValidate(t *testing.T) {
 func TestBadTLSConfigs(t *testing.T) {
 	testCases := []struct {
 		desc        string
-		tlsConfig   configtls.TLSClientSetting
+		tlsConfig   configtls.ClientConfig
 		expectError bool
 	}{
 		{
 			desc: "CA file not found",
-			tlsConfig: configtls.TLSClientSetting{
-				TLSSetting: configtls.TLSSetting{
+			tlsConfig: configtls.ClientConfig{
+				Config: configtls.Config{
 					CAFile: "not/a/real/file.pem",
 				},
 				Insecure:           false,
@@ -123,8 +120,8 @@ func TestBadTLSConfigs(t *testing.T) {
 		},
 		{
 			desc: "no issues",
-			tlsConfig: configtls.TLSClientSetting{
-				TLSSetting:         configtls.TLSSetting{},
+			tlsConfig: configtls.ClientConfig{
+				Config:             configtls.Config{},
 				Insecure:           false,
 				InsecureSkipVerify: false,
 				ServerName:         "",
@@ -134,17 +131,18 @@ func TestBadTLSConfigs(t *testing.T) {
 	}
 	for _, tc := range testCases {
 		t.Run(tc.desc, func(t *testing.T) {
-			cfg := Config{
+			cfg := &Config{
 				Username: "otel",
 				Password: "pword",
-				Hosts: []confignet.NetAddr{
+				Hosts: []confignet.TCPAddrConfig{
 					{
-						Endpoint: "localhost:27017",
+						Endpoint: defaultEndpoint,
 					},
 				},
-				TLSClientSetting: tc.tlsConfig,
+				ControllerConfig: scraperhelper.NewDefaultControllerConfig(),
+				ClientConfig:     tc.tlsConfig,
 			}
-			err := cfg.Validate()
+			err := component.ValidateConfig(cfg)
 			if tc.expectError {
 				require.Error(t, err)
 			} else {
@@ -156,9 +154,9 @@ func TestBadTLSConfigs(t *testing.T) {
 
 func TestOptions(t *testing.T) {
 	cfg := &Config{
-		Hosts: []confignet.NetAddr{
+		Hosts: []confignet.TCPAddrConfig{
 			{
-				Endpoint: "localhost:27017",
+				Endpoint: defaultEndpoint,
 			},
 		},
 		Username:   "uname",
@@ -174,4 +172,49 @@ func TestOptions(t *testing.T) {
 		(2 * time.Minute).Milliseconds(),
 	)
 	require.Equal(t, "rs-1", *clientOptions.ReplicaSet)
+}
+
+func TestOptionsTLS(t *testing.T) {
+	// loading valid ca file
+	caFile := filepath.Join("testdata", "certs", "ca.crt")
+
+	cfg := &Config{
+		Hosts: []confignet.TCPAddrConfig{
+			{
+				Endpoint: defaultEndpoint,
+			},
+		},
+		ClientConfig: configtls.ClientConfig{
+			Insecure: false,
+			Config: configtls.Config{
+				CAFile: caFile,
+			},
+		},
+	}
+	opts := cfg.ClientOptions()
+	require.NotNil(t, opts.TLSConfig)
+}
+
+func TestLoadConfig(t *testing.T) {
+	cm, err := confmaptest.LoadConf(filepath.Join("testdata", "config.yaml"))
+	require.NoError(t, err)
+
+	factory := NewFactory()
+	cfg := factory.CreateDefaultConfig()
+
+	sub, err := cm.Sub(component.NewIDWithName(metadata.Type, "").String())
+	require.NoError(t, err)
+	require.NoError(t, sub.Unmarshal(cfg))
+
+	expected := factory.CreateDefaultConfig().(*Config)
+	expected.Hosts = []confignet.TCPAddrConfig{
+		{
+			Endpoint: defaultEndpoint,
+		},
+	}
+	expected.Username = "otel"
+	expected.Password = "${env:MONGO_PASSWORD}"
+	expected.CollectionInterval = time.Minute
+
+	require.Equal(t, expected, cfg)
 }

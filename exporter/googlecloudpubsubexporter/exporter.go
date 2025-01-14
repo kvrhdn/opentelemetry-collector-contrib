@@ -1,69 +1,175 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
 package googlecloudpubsubexporter // import "github.com/open-telemetry/opentelemetry-collector-contrib/exporter/googlecloudpubsubexporter"
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
+	"fmt"
+	"time"
 
+	"cloud.google.com/go/pubsub/apiv1/pubsubpb"
+	"github.com/google/uuid"
 	"go.opentelemetry.io/collector/component"
-	"go.opentelemetry.io/collector/consumer"
-	"go.opentelemetry.io/collector/model/pdata"
+	"go.opentelemetry.io/collector/pdata/plog"
+	"go.opentelemetry.io/collector/pdata/pmetric"
+	"go.opentelemetry.io/collector/pdata/ptrace"
 	"go.uber.org/zap"
 )
 
 const name = "googlecloudpubsub"
 
 type pubsubExporter struct {
-	instanceName string
-	logger       *zap.Logger
-
-	topicName string
-
-	//
-	userAgent string
-	ceSource  string
-	config    *Config
-	//
+	logger               *zap.Logger
+	client               publisherClient
+	cancel               context.CancelFunc
+	userAgent            string
+	ceSource             string
+	ceCompression        compression
+	config               *Config
+	tracesMarshaler      ptrace.Marshaler
+	tracesWatermarkFunc  tracesWatermarkFunc
+	metricsMarshaler     pmetric.Marshaler
+	metricsWatermarkFunc metricsWatermarkFunc
+	logsMarshaler        plog.Marshaler
+	logsWatermarkFunc    logsWatermarkFunc
 }
 
 func (*pubsubExporter) Name() string {
 	return name
 }
 
+type encoding int
+
+const (
+	otlpProtoTrace  encoding = iota
+	otlpProtoMetric          = iota
+	otlpProtoLog             = iota
+)
+
+type compression int
+
+const (
+	uncompressed compression = iota
+	gZip                     = iota
+)
+
+type WatermarkBehavior int
+
+const (
+	current  WatermarkBehavior = iota
+	earliest                   = iota
+)
+
 func (ex *pubsubExporter) start(ctx context.Context, _ component.Host) error {
-	return nil
-}
+	ctx, ex.cancel = context.WithCancel(ctx)
 
-func (ex *pubsubExporter) shutdown(context.Context) error {
-	return nil
-}
+	if ex.client == nil {
+		client, err := newPublisherClient(ctx, ex.config, ex.userAgent)
+		if err != nil {
+			return fmt.Errorf("failed creating the gRPC client to Pubsub: %w", err)
+		}
 
-func (ex *pubsubExporter) Capabilities() consumer.Capabilities {
-	return consumer.Capabilities{
-		MutatesData: false,
+		ex.client = client
 	}
-}
-
-func (ex *pubsubExporter) consumeTraces(ctx context.Context, td pdata.Traces) error {
 	return nil
 }
 
-func (ex *pubsubExporter) consumeMetrics(ctx context.Context, td pdata.Metrics) error {
-	return nil
+func (ex *pubsubExporter) shutdown(_ context.Context) error {
+	if ex.client == nil {
+		return nil
+	}
+
+	client := ex.client
+	ex.client = nil
+	return client.Close()
 }
 
-func (ex *pubsubExporter) consumeLogs(ctx context.Context, td pdata.Logs) error {
-	return nil
+func (ex *pubsubExporter) publishMessage(ctx context.Context, encoding encoding, data []byte, watermark time.Time) error {
+	id, err := uuid.NewRandom()
+	if err != nil {
+		return err
+	}
+	ceTime, err := watermark.MarshalText()
+	if err != nil {
+		return err
+	}
+
+	attributes := map[string]string{
+		"ce-specversion": "1.0",
+		"ce-id":          id.String(),
+		"ce-source":      ex.ceSource,
+		"ce-time":        string(ceTime),
+	}
+	switch encoding {
+	case otlpProtoTrace:
+		attributes["ce-type"] = "org.opentelemetry.otlp.traces.v1"
+		attributes["content-type"] = "application/protobuf"
+	case otlpProtoMetric:
+		attributes["ce-type"] = "org.opentelemetry.otlp.metrics.v1"
+		attributes["content-type"] = "application/protobuf"
+	case otlpProtoLog:
+		attributes["ce-type"] = "org.opentelemetry.otlp.logs.v1"
+		attributes["content-type"] = "application/protobuf"
+	}
+	if ex.ceCompression == gZip {
+		attributes["content-encoding"] = "gzip"
+		data, err = ex.compress(data)
+		if err != nil {
+			return err
+		}
+	}
+	_, err = ex.client.Publish(ctx, &pubsubpb.PublishRequest{
+		Topic: ex.config.Topic,
+		Messages: []*pubsubpb.PubsubMessage{
+			{
+				Attributes: attributes,
+				Data:       data,
+			},
+		},
+	})
+	return err
+}
+
+func (ex *pubsubExporter) compress(payload []byte) ([]byte, error) {
+	if ex.ceCompression == gZip {
+		var buf bytes.Buffer
+		writer := gzip.NewWriter(&buf)
+		_, err := writer.Write(payload)
+		if err != nil {
+			return nil, err
+		}
+		err = writer.Close()
+		if err != nil {
+			return nil, err
+		}
+		return buf.Bytes(), nil
+	}
+	return payload, nil
+}
+
+func (ex *pubsubExporter) consumeTraces(ctx context.Context, traces ptrace.Traces) error {
+	buffer, err := ex.tracesMarshaler.MarshalTraces(traces)
+	if err != nil {
+		return err
+	}
+	return ex.publishMessage(ctx, otlpProtoTrace, buffer, ex.tracesWatermarkFunc(traces, time.Now(), ex.config.Watermark.AllowedDrift).UTC())
+}
+
+func (ex *pubsubExporter) consumeMetrics(ctx context.Context, metrics pmetric.Metrics) error {
+	buffer, err := ex.metricsMarshaler.MarshalMetrics(metrics)
+	if err != nil {
+		return err
+	}
+	return ex.publishMessage(ctx, otlpProtoMetric, buffer, ex.metricsWatermarkFunc(metrics, time.Now(), ex.config.Watermark.AllowedDrift).UTC())
+}
+
+func (ex *pubsubExporter) consumeLogs(ctx context.Context, logs plog.Logs) error {
+	buffer, err := ex.logsMarshaler.MarshalLogs(logs)
+	if err != nil {
+		return err
+	}
+	return ex.publishMessage(ctx, otlpProtoLog, buffer, ex.logsWatermarkFunc(logs, time.Now(), ex.config.Watermark.AllowedDrift).UTC())
 }

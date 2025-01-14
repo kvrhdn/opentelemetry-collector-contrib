@@ -1,16 +1,5 @@
-// Copyright  The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
 
 package metadata
 
@@ -19,7 +8,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"go.opentelemetry.io/collector/model/pdata"
+	"go.opentelemetry.io/collector/pdata/pcommon"
 )
 
 func TestStringLabelValueMetadata(t *testing.T) {
@@ -111,14 +100,14 @@ func TestStringLabelValue(t *testing.T) {
 	assert.Equal(t, StringValueType, labelValue.Metadata().ValueType())
 	assert.Equal(t, stringValue, labelValue.Value())
 
-	attributes := pdata.NewAttributeMap()
+	attributes := pcommon.NewMap()
 
 	labelValue.SetValueTo(attributes)
 
 	attributeValue, exists := attributes.Get(labelName)
 
 	assert.True(t, exists)
-	assert.Equal(t, stringValue, attributeValue.StringVal())
+	assert.Equal(t, stringValue, attributeValue.Str())
 }
 
 func TestInt64LabelValue(t *testing.T) {
@@ -131,14 +120,14 @@ func TestInt64LabelValue(t *testing.T) {
 	assert.Equal(t, IntValueType, labelValue.Metadata().ValueType())
 	assert.Equal(t, int64Value, labelValue.Value())
 
-	attributes := pdata.NewAttributeMap()
+	attributes := pcommon.NewMap()
 
 	labelValue.SetValueTo(attributes)
 
 	attributeValue, exists := attributes.Get(labelName)
 
 	assert.True(t, exists)
-	assert.Equal(t, int64Value, attributeValue.IntVal())
+	assert.Equal(t, int64Value, attributeValue.Int())
 }
 
 func TestBoolLabelValue(t *testing.T) {
@@ -151,14 +140,14 @@ func TestBoolLabelValue(t *testing.T) {
 	assert.Equal(t, BoolValueType, labelValue.Metadata().ValueType())
 	assert.Equal(t, boolValue, labelValue.Value())
 
-	attributes := pdata.NewAttributeMap()
+	attributes := pcommon.NewMap()
 
 	labelValue.SetValueTo(attributes)
 
 	attributeValue, exists := attributes.Get(labelName)
 
 	assert.True(t, exists)
-	assert.Equal(t, boolValue, attributeValue.BoolVal())
+	assert.Equal(t, boolValue, attributeValue.Bool())
 }
 
 func TestStringSliceLabelValue(t *testing.T) {
@@ -171,14 +160,14 @@ func TestStringSliceLabelValue(t *testing.T) {
 	assert.Equal(t, StringSliceValueType, labelValue.Metadata().ValueType())
 	assert.Equal(t, stringValue, labelValue.Value())
 
-	attributes := pdata.NewAttributeMap()
+	attributes := pcommon.NewMap()
 
 	labelValue.SetValueTo(attributes)
 
 	attributeValue, exists := attributes.Get(labelName)
 
 	assert.True(t, exists)
-	assert.Equal(t, stringValue, attributeValue.StringVal())
+	assert.Equal(t, stringValue, attributeValue.Str())
 }
 
 func TestByteSliceLabelValue(t *testing.T) {
@@ -191,14 +180,17 @@ func TestByteSliceLabelValue(t *testing.T) {
 	assert.Equal(t, ByteSliceValueType, labelValue.Metadata().ValueType())
 	assert.Equal(t, stringValue, labelValue.Value())
 
-	attributes := pdata.NewAttributeMap()
+	attributes := pcommon.NewMap()
 
 	labelValue.SetValueTo(attributes)
 
 	attributeValue, exists := attributes.Get(labelName)
 
 	assert.True(t, exists)
-	assert.Equal(t, stringValue, attributeValue.StringVal())
+	assert.Equal(t, stringValue, attributeValue.Str())
+
+	labelValue.ModifyValue(labelName)
+	assert.Equal(t, labelName, labelValue.Value())
 }
 
 func TestLockRequestSliceLabelValue(t *testing.T) {
@@ -211,14 +203,14 @@ func TestLockRequestSliceLabelValue(t *testing.T) {
 	assert.Equal(t, LockRequestSliceValueType, labelValue.Metadata().ValueType())
 	assert.Equal(t, stringValue, labelValue.Value())
 
-	attributes := pdata.NewAttributeMap()
+	attributes := pcommon.NewMap()
 
 	labelValue.SetValueTo(attributes)
 
 	attributeValue, exists := attributes.Get(labelName)
 
 	assert.True(t, exists)
-	assert.Equal(t, stringValue, attributeValue.StringVal())
+	assert.Equal(t, stringValue, attributeValue.Str())
 }
 
 func TestNewStringLabelValue(t *testing.T) {

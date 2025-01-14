@@ -1,16 +1,5 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
 package correlation
 
@@ -23,30 +12,31 @@ import (
 	"go.opentelemetry.io/collector/component/componenttest"
 	"go.opentelemetry.io/collector/config/confighttp"
 	"go.opentelemetry.io/collector/config/configtls"
-	"go.opentelemetry.io/collector/model/pdata"
+	"go.opentelemetry.io/collector/exporter/exportertest"
+	"go.opentelemetry.io/collector/pdata/ptrace"
 )
 
 func TestTrackerAddSpans(t *testing.T) {
 	tracker := NewTracker(
 		DefaultConfig(),
 		"abcd",
-		componenttest.NewNopExporterCreateSettings(),
+		exportertest.NewNopSettings(),
 	)
 
 	err := tracker.Start(context.Background(), componenttest.NewNopHost())
 	require.NoError(t, err)
 	assert.NotNil(t, tracker.correlation, "correlation context should be set")
 
-	traces := pdata.NewTraces()
+	traces := ptrace.NewTraces()
 	rs := traces.ResourceSpans().AppendEmpty()
 	attr := rs.Resource().Attributes()
-	attr.InsertString("host.name", "localhost")
+	attr.PutStr("host.name", "localhost")
 
 	// Add empty first, should ignore.
-	tracker.AddSpans(context.Background(), pdata.NewTraces())
+	assert.NoError(t, tracker.ProcessTraces(context.Background(), ptrace.NewTraces()))
 	assert.Nil(t, tracker.traceTracker)
 
-	tracker.AddSpans(context.Background(), traces)
+	assert.NoError(t, tracker.ProcessTraces(context.Background(), traces))
 
 	assert.NotNil(t, tracker.traceTracker, "trace tracker should be set")
 
@@ -54,7 +44,6 @@ func TestTrackerAddSpans(t *testing.T) {
 }
 
 func TestTrackerStart(t *testing.T) {
-
 	tests := []struct {
 		name    string
 		config  *Config
@@ -64,10 +53,10 @@ func TestTrackerStart(t *testing.T) {
 		{
 			name: "invalid http client settings fails",
 			config: &Config{
-				HTTPClientSettings: confighttp.HTTPClientSettings{
+				ClientConfig: confighttp.ClientConfig{
 					Endpoint: "localhost:9090",
-					TLSSetting: configtls.TLSClientSetting{
-						TLSSetting: configtls.TLSSetting{
+					TLSSetting: configtls.ClientConfig{
+						Config: configtls.Config{
 							CAFile: "/non/existent",
 						},
 					},
@@ -83,7 +72,7 @@ func TestTrackerStart(t *testing.T) {
 			tracker := NewTracker(
 				tt.config,
 				"abcd",
-				componenttest.NewNopExporterCreateSettings(),
+				exportertest.NewNopSettings(),
 			)
 
 			err := tracker.Start(context.Background(), componenttest.NewNopHost())
@@ -91,11 +80,13 @@ func TestTrackerStart(t *testing.T) {
 			if tt.wantErr {
 				require.Error(t, err)
 				if tt.errMsg != "" {
-					require.Contains(t, err.Error(), tt.errMsg)
+					require.ErrorContains(t, err, tt.errMsg)
 				}
 			} else {
 				require.NoError(t, err)
 			}
+
+			assert.NoError(t, tracker.Shutdown(context.Background()))
 		})
 	}
 }

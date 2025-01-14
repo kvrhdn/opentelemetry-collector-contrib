@@ -1,16 +1,5 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
 package lokiexporter // import "github.com/open-telemetry/opentelemetry-collector-contrib/exporter/lokiexporter"
 
@@ -18,29 +7,27 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
-	"strconv"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/gogo/protobuf/proto"
 	"github.com/golang/snappy"
-	"github.com/prometheus/common/model"
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/consumer/consumererror"
-	"go.opentelemetry.io/collector/model/pdata"
+	"go.opentelemetry.io/collector/pdata/plog"
 	"go.uber.org/multierr"
 	"go.uber.org/zap"
 
-	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/lokiexporter/internal/third_party/loki/logproto"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/lokiexporter/internal/metadata"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/translator/loki"
 )
 
 const (
-	maxErrMsgLen = 1024
+	maxErrMsgLen          = 1024
+	missingLabelsErrorMsg = "error at least one label pair is required per stream"
 )
 
 type lokiExporter struct {
@@ -48,29 +35,53 @@ type lokiExporter struct {
 	settings component.TelemetrySettings
 	client   *http.Client
 	wg       sync.WaitGroup
-	convert  func(pdata.LogRecord, pdata.Resource) (*logproto.Entry, error)
+
+	telemetryBuilder *metadata.TelemetryBuilder
 }
 
-func newExporter(config *Config, settings component.TelemetrySettings) *lokiExporter {
-	lokiexporter := &lokiExporter{
-		config:   config,
-		settings: settings,
+func newExporter(config *Config, settings component.TelemetrySettings) (*lokiExporter, error) {
+	settings.Logger.Info("using the new Loki exporter")
+
+	builder, err := metadata.NewTelemetryBuilder(settings)
+	if err != nil {
+		return nil, err
 	}
-	if config.Format == "json" {
-		lokiexporter.convert = lokiexporter.convertLogToJSONEntry
-	} else {
-		lokiexporter.convert = lokiexporter.convertLogBodyToEntry
-	}
-	return lokiexporter
+
+	return &lokiExporter{
+		config:           config,
+		settings:         settings,
+		telemetryBuilder: builder,
+	}, nil
 }
 
-func (l *lokiExporter) pushLogData(ctx context.Context, ld pdata.Logs) error {
-	l.wg.Add(1)
-	defer l.wg.Done()
+func (l *lokiExporter) pushLogData(ctx context.Context, ld plog.Logs) error {
+	requests := loki.LogsToLokiRequests(ld, l.config.DefaultLabelsEnabled)
 
-	pushReq, _ := l.logDataToLoki(ld)
+	var errs error
+	for tenant, request := range requests {
+		err := l.sendPushRequest(ctx, tenant, request, ld)
+		if isErrMissingLabels(err) {
+			l.telemetryBuilder.LokiexporterSendFailedDueToMissingLabels.Add(ctx, int64(ld.LogRecordCount()))
+		}
+
+		errs = multierr.Append(errs, err)
+	}
+
+	return errs
+}
+
+func (l *lokiExporter) sendPushRequest(ctx context.Context, tenant string, request loki.PushRequest, ld plog.Logs) error {
+	pushReq := request.PushRequest
+	report := request.Report
 	if len(pushReq.Streams) == 0 {
 		return consumererror.NewPermanent(fmt.Errorf("failed to transform logs into Loki log streams"))
+	}
+	if len(report.Errors) > 0 {
+		l.settings.Logger.Info(
+			"not all log entries were converted to Loki",
+			zap.Int("dropped", report.NumDropped),
+			zap.Int("submitted", report.NumSubmitted),
+		)
 	}
 
 	buf, err := encode(pushReq)
@@ -78,18 +89,17 @@ func (l *lokiExporter) pushLogData(ctx context.Context, ld pdata.Logs) error {
 		return consumererror.NewPermanent(err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", l.config.HTTPClientSettings.Endpoint, bytes.NewReader(buf))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, l.config.ClientConfig.Endpoint, bytes.NewReader(buf))
 	if err != nil {
 		return consumererror.NewPermanent(err)
 	}
 
-	for k, v := range l.config.HTTPClientSettings.Headers {
-		req.Header.Set(k, v)
+	for k, v := range l.config.ClientConfig.Headers {
+		req.Header.Set(k, string(v))
 	}
 	req.Header.Set("Content-Type", "application/x-protobuf")
-
-	if len(l.config.TenantID) > 0 {
-		req.Header.Set("X-Scope-OrgID", l.config.TenantID)
+	if len(tenant) > 0 {
+		req.Header.Set("X-Scope-OrgID", tenant)
 	}
 
 	resp, err := l.client.Do(req)
@@ -109,6 +119,14 @@ func (l *lokiExporter) pushLogData(ctx context.Context, ld pdata.Logs) error {
 			line = scanner.Text()
 		}
 		err = fmt.Errorf("HTTP %d %q: %s", resp.StatusCode, http.StatusText(resp.StatusCode), line)
+
+		// Errors with 4xx status code (excluding 429) should not be retried
+		if resp.StatusCode >= http.StatusBadRequest &&
+			resp.StatusCode < http.StatusInternalServerError &&
+			resp.StatusCode != http.StatusTooManyRequests {
+			return consumererror.NewPermanent(err)
+		}
+
 		return consumererror.NewLogs(err, ld)
 	}
 
@@ -124,8 +142,8 @@ func encode(pb proto.Message) ([]byte, error) {
 	return buf, nil
 }
 
-func (l *lokiExporter) start(_ context.Context, host component.Host) (err error) {
-	client, err := l.config.HTTPClientSettings.ToClient(host.GetExtensions(), l.settings)
+func (l *lokiExporter) start(ctx context.Context, host component.Host) (err error) {
+	client, err := l.config.ClientConfig.ToClient(ctx, host, l.settings)
 	if err != nil {
 		return err
 	}
@@ -140,169 +158,9 @@ func (l *lokiExporter) stop(context.Context) (err error) {
 	return nil
 }
 
-func (l *lokiExporter) logDataToLoki(ld pdata.Logs) (pr *logproto.PushRequest, numDroppedLogs int) {
-	var errs error
-
-	streams := make(map[string]*logproto.Stream)
-	rls := ld.ResourceLogs()
-	for i := 0; i < rls.Len(); i++ {
-		ills := rls.At(i).InstrumentationLibraryLogs()
-		resource := rls.At(i).Resource()
-		for j := 0; j < ills.Len(); j++ {
-			logs := ills.At(j).LogRecords()
-			for k := 0; k < logs.Len(); k++ {
-				log := logs.At(k)
-
-				mergedLabels, dropped := l.convertAttributesAndMerge(log.Attributes(), resource.Attributes())
-				if dropped {
-					numDroppedLogs++
-					continue
-				}
-				labels := mergedLabels.String()
-				var entry *logproto.Entry
-				var err error
-				entry, err = l.convert(log, resource)
-				if err != nil {
-					// Couldn't convert so dropping log.
-					numDroppedLogs++
-					errs = multierr.Append(
-						errs,
-						errors.New(
-							fmt.Sprint(
-								"failed to convert, dropping log",
-								zap.String("format", l.config.Format),
-								zap.Error(err),
-							),
-						),
-					)
-					continue
-				}
-
-				if stream, ok := streams[labels]; ok {
-					stream.Entries = append(stream.Entries, *entry)
-					continue
-				}
-
-				streams[labels] = &logproto.Stream{
-					Labels:  labels,
-					Entries: []logproto.Entry{*entry},
-				}
-			}
-		}
+func isErrMissingLabels(err error) bool {
+	if err == nil {
+		return false
 	}
-
-	if errs != nil {
-		l.settings.Logger.Debug("some logs has been dropped", zap.Error(errs))
-	}
-
-	pr = &logproto.PushRequest{
-		Streams: make([]logproto.Stream, len(streams)),
-	}
-
-	i := 0
-	for _, stream := range streams {
-		pr.Streams[i] = *stream
-		i++
-	}
-
-	return pr, numDroppedLogs
-}
-
-func (l *lokiExporter) convertAttributesAndMerge(logAttrs pdata.AttributeMap, resourceAttrs pdata.AttributeMap) (mergedAttributes model.LabelSet, dropped bool) {
-	logRecordAttributes := l.convertAttributesToLabels(logAttrs, l.config.Labels.Attributes)
-	resourceAttributes := l.convertAttributesToLabels(resourceAttrs, l.config.Labels.ResourceAttributes)
-
-	// This prometheus model.labelset Merge function overwrites	the logRecordAttributes with resourceAttributes
-	mergedAttributes = logRecordAttributes.Merge(resourceAttributes)
-
-	if len(mergedAttributes) == 0 {
-		return nil, true
-	}
-	return mergedAttributes, false
-}
-
-func (l *lokiExporter) convertAttributesToLabels(attributes pdata.AttributeMap, allowedAttributes map[string]string) model.LabelSet {
-	ls := model.LabelSet{}
-
-	allowedLabels := l.config.Labels.getAttributes(allowedAttributes)
-
-	for attr, attrLabelName := range allowedLabels {
-		av, ok := attributes.Get(attr)
-		if ok {
-			if av.Type() != pdata.AttributeValueTypeString {
-				l.settings.Logger.Debug("Failed to convert attribute value to Loki label value, value is not a string", zap.String("attribute", attr))
-				continue
-			}
-			ls[attrLabelName] = model.LabelValue(av.StringVal())
-		}
-	}
-
-	return ls
-}
-
-func (l *lokiExporter) convertLogBodyToEntry(lr pdata.LogRecord, res pdata.Resource) (*logproto.Entry, error) {
-	var b strings.Builder
-
-	if len(lr.SeverityText()) > 0 {
-		b.WriteString("severity=")
-		b.WriteString(lr.SeverityText())
-		b.WriteRune(' ')
-	}
-	if lr.SeverityNumber() > 0 {
-		b.WriteString("severityN=")
-		b.WriteString(strconv.Itoa(int(lr.SeverityNumber())))
-		b.WriteRune(' ')
-	}
-	if !lr.TraceID().IsEmpty() {
-		b.WriteString("traceID=")
-		b.WriteString(lr.TraceID().HexString())
-		b.WriteRune(' ')
-	}
-	if !lr.SpanID().IsEmpty() {
-		b.WriteString("spanID=")
-		b.WriteString(lr.SpanID().HexString())
-		b.WriteRune(' ')
-	}
-
-	// fields not added to the accept-list as part of the component's config
-	// are added to the body, so that they can still be seen under "detected fields"
-	lr.Attributes().Range(func(k string, v pdata.AttributeValue) bool {
-		if _, found := l.config.Labels.Attributes[k]; !found {
-			b.WriteString(k)
-			b.WriteString("=")
-			b.WriteString(v.AsString())
-			b.WriteRune(' ')
-		}
-		return true
-	})
-
-	// same for resources: include all, except the ones that are explicitly added
-	// as part of the config, which are showing up at the top-level already
-	res.Attributes().Range(func(k string, v pdata.AttributeValue) bool {
-		if _, found := l.config.Labels.ResourceAttributes[k]; !found {
-			b.WriteString(k)
-			b.WriteString("=")
-			b.WriteString(v.AsString())
-			b.WriteRune(' ')
-		}
-		return true
-	})
-
-	b.WriteString(lr.Body().StringVal())
-
-	return &logproto.Entry{
-		Timestamp: time.Unix(0, int64(lr.Timestamp())),
-		Line:      b.String(),
-	}, nil
-}
-
-func (l *lokiExporter) convertLogToJSONEntry(lr pdata.LogRecord, res pdata.Resource) (*logproto.Entry, error) {
-	line, err := encodeJSON(lr, res)
-	if err != nil {
-		return nil, err
-	}
-	return &logproto.Entry{
-		Timestamp: time.Unix(0, int64(lr.Timestamp())),
-		Line:      line,
-	}, nil
+	return strings.Contains(err.Error(), missingLabelsErrorMsg)
 }

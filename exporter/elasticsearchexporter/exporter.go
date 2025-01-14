@@ -1,113 +1,139 @@
-// Copyright 2020, OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
 
-// Package elasticsearchexporter contains an opentelemetry-collector exporter
-// for Elasticsearch.
 package elasticsearchexporter // import "github.com/open-telemetry/opentelemetry-collector-contrib/exporter/elasticsearchexporter"
 
 import (
 	"bytes"
 	"context"
-	"crypto/tls"
+	"errors"
 	"fmt"
-	"io"
-	"net/http"
+	"runtime"
+	"sync"
 	"time"
 
-	"github.com/cenkalti/backoff/v4"
-	elasticsearch7 "github.com/elastic/go-elasticsearch/v7"
-	esutil7 "github.com/elastic/go-elasticsearch/v7/esutil"
-	"go.opentelemetry.io/collector/model/pdata"
-	"go.uber.org/multierr"
+	"go.opentelemetry.io/collector/component"
+	"go.opentelemetry.io/collector/exporter"
+	"go.opentelemetry.io/collector/pdata/pcommon"
+	"go.opentelemetry.io/collector/pdata/plog"
+	"go.opentelemetry.io/collector/pdata/pmetric"
+	"go.opentelemetry.io/collector/pdata/ptrace"
 	"go.uber.org/zap"
 
-	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/coreinternal/sanitize"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/elasticsearchexporter/internal/objmodel"
 )
 
-type esClientCurrent = elasticsearch7.Client
-type esConfigCurrent = elasticsearch7.Config
-type esBulkIndexerCurrent = esutil7.BulkIndexer
-type esBulkIndexerItem = esutil7.BulkIndexerItem
-type esBulkIndexerResponseItem = esutil7.BulkIndexerResponseItem
-
 type elasticsearchExporter struct {
-	logger *zap.Logger
+	component.TelemetrySettings
+	userAgent string
 
-	index       string
-	maxAttempts int
+	config         *Config
+	index          string
+	logstashFormat LogstashFormatSettings
+	dynamicIndex   bool
+	model          mappingModel
+	otel           bool
 
-	client      *esClientCurrent
-	bulkIndexer esBulkIndexerCurrent
-	model       mappingModel
+	wg          sync.WaitGroup // active sessions
+	bulkIndexer bulkIndexer
 }
 
-var retryOnStatus = []int{500, 502, 503, 504, 429}
-
-const createAction = "create"
-
-func newExporter(logger *zap.Logger, cfg *Config) (*elasticsearchExporter, error) {
-	if err := cfg.Validate(); err != nil {
-		return nil, err
+func newExporter(
+	cfg *Config,
+	set exporter.Settings,
+	index string,
+	dynamicIndex bool,
+) *elasticsearchExporter {
+	model := &encodeModel{
+		dedot: cfg.Mapping.Dedot,
+		mode:  cfg.MappingMode(),
 	}
 
-	client, err := newElasticsearchClient(logger, cfg)
-	if err != nil {
-		return nil, err
-	}
+	otel := model.mode == MappingOTel
 
-	bulkIndexer, err := newBulkIndexer(logger, client, cfg)
-	if err != nil {
-		return nil, err
-	}
-
-	maxAttempts := 1
-	if cfg.Retry.Enabled {
-		maxAttempts = cfg.Retry.MaxRequests
-	}
-
-	// TODO: Apply encoding and field mapping settings.
-	model := &encodeModel{dedup: true, dedot: false}
+	userAgent := fmt.Sprintf(
+		"%s/%s (%s/%s)",
+		set.BuildInfo.Description,
+		set.BuildInfo.Version,
+		runtime.GOOS,
+		runtime.GOARCH,
+	)
 
 	return &elasticsearchExporter{
-		logger:      logger,
-		client:      client,
-		bulkIndexer: bulkIndexer,
+		TelemetrySettings: set.TelemetrySettings,
+		userAgent:         userAgent,
 
-		index:       cfg.Index,
-		maxAttempts: maxAttempts,
-		model:       model,
-	}, nil
+		config:         cfg,
+		index:          index,
+		dynamicIndex:   dynamicIndex,
+		model:          model,
+		logstashFormat: cfg.LogstashFormat,
+		otel:           otel,
+	}
+}
+
+func (e *elasticsearchExporter) Start(ctx context.Context, host component.Host) error {
+	client, err := newElasticsearchClient(ctx, e.config, host, e.TelemetrySettings, e.userAgent)
+	if err != nil {
+		return err
+	}
+	bulkIndexer, err := newBulkIndexer(e.Logger, client, e.config)
+	if err != nil {
+		return err
+	}
+	e.bulkIndexer = bulkIndexer
+	return nil
 }
 
 func (e *elasticsearchExporter) Shutdown(ctx context.Context) error {
-	return e.bulkIndexer.Close(ctx)
+	if e.bulkIndexer != nil {
+		if err := e.bulkIndexer.Close(ctx); err != nil {
+			return err
+		}
+	}
+
+	doneCh := make(chan struct{})
+	go func() {
+		e.wg.Wait()
+		close(doneCh)
+	}()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-doneCh:
+		return nil
+	}
 }
 
-func (e *elasticsearchExporter) pushLogsData(ctx context.Context, ld pdata.Logs) error {
-	var errs []error
+func (e *elasticsearchExporter) pushLogsData(ctx context.Context, ld plog.Logs) error {
+	e.wg.Add(1)
+	defer e.wg.Done()
 
+	session, err := e.bulkIndexer.StartSession(ctx)
+	if err != nil {
+		return err
+	}
+	defer session.End()
+
+	var errs []error
 	rls := ld.ResourceLogs()
 	for i := 0; i < rls.Len(); i++ {
 		rl := rls.At(i)
 		resource := rl.Resource()
-		ills := rl.InstrumentationLibraryLogs()
+		ills := rl.ScopeLogs()
 		for j := 0; j < ills.Len(); j++ {
-			logs := ills.At(i).LogRecords()
+			ill := ills.At(j)
+			scope := ill.Scope()
+			logs := ill.LogRecords()
 			for k := 0; k < logs.Len(); k++ {
-				if err := e.pushLogRecord(ctx, resource, logs.At(k)); err != nil {
+				if err := e.pushLogRecord(ctx, resource, rl.SchemaUrl(), logs.At(k), scope, ill.SchemaUrl(), session); err != nil {
 					if cerr := ctx.Err(); cerr != nil {
 						return cerr
+					}
+
+					if errors.Is(err, ErrInvalidTypeForBodyMapMode) {
+						e.Logger.Warn("dropping log record", zap.Error(err))
+						continue
 					}
 
 					errs = append(errs, err)
@@ -116,205 +142,312 @@ func (e *elasticsearchExporter) pushLogsData(ctx context.Context, ld pdata.Logs)
 		}
 	}
 
-	return multierr.Combine(errs...)
-}
-
-func (e *elasticsearchExporter) pushLogRecord(ctx context.Context, resource pdata.Resource, record pdata.LogRecord) error {
-	document, err := e.model.encodeLog(resource, record)
-	if err != nil {
-		return fmt.Errorf("Failed to encode log event: %w", err)
+	if err := session.Flush(ctx); err != nil {
+		if cerr := ctx.Err(); cerr != nil {
+			return cerr
+		}
+		errs = append(errs, err)
 	}
-	return e.pushEvent(ctx, document)
+	return errors.Join(errs...)
 }
 
-func (e *elasticsearchExporter) pushEvent(ctx context.Context, document []byte) error {
-	attempts := 1
-	body := bytes.NewReader(document)
-	item := esBulkIndexerItem{Action: createAction, Index: e.index, Body: body}
+func (e *elasticsearchExporter) pushLogRecord(
+	ctx context.Context,
+	resource pcommon.Resource,
+	resourceSchemaURL string,
+	record plog.LogRecord,
+	scope pcommon.InstrumentationScope,
+	scopeSchemaURL string,
+	bulkIndexerSession bulkIndexerSession,
+) error {
+	fIndex := e.index
+	if e.dynamicIndex {
+		fIndex = routeLogRecord(record.Attributes(), scope.Attributes(), resource.Attributes(), fIndex, e.otel, scope.Name())
+	}
 
-	// Setup error handler. The handler handles the per item response status based on the
-	// selective ACKing in the bulk response.
-	item.OnFailure = func(ctx context.Context, item esBulkIndexerItem, resp esBulkIndexerResponseItem, err error) {
-		switch {
-		case attempts < e.maxAttempts && shouldRetryEvent(resp.Status):
-			e.logger.Debug("Retrying to index event",
-				zap.Int("attempt", attempts),
-				zap.Int("status", resp.Status),
-				zap.NamedError("reason", err))
+	if e.logstashFormat.Enabled {
+		formattedIndex, err := generateIndexWithLogstashFormat(fIndex, &e.logstashFormat, time.Now())
+		if err != nil {
+			return err
+		}
+		fIndex = formattedIndex
+	}
 
-			attempts++
-			body.Seek(0, io.SeekStart)
-			e.bulkIndexer.Add(ctx, item)
+	document, err := e.model.encodeLog(resource, resourceSchemaURL, record, scope, scopeSchemaURL)
+	if err != nil {
+		return fmt.Errorf("failed to encode log event: %w", err)
+	}
+	return bulkIndexerSession.Add(ctx, fIndex, bytes.NewReader(document), nil)
+}
 
-		case resp.Status == 0 && err != nil:
-			// Encoding error. We didn't even attempt to send the event
-			e.logger.Error("Drop event: failed to add event to the bulk request buffer.",
-				zap.NamedError("reason", err))
+func (e *elasticsearchExporter) pushMetricsData(
+	ctx context.Context,
+	metrics pmetric.Metrics,
+) error {
+	e.wg.Add(1)
+	defer e.wg.Done()
 
-		case err != nil:
-			e.logger.Error("Drop event: failed to index event",
-				zap.Int("attempt", attempts),
-				zap.Int("status", resp.Status),
-				zap.NamedError("reason", err))
+	session, err := e.bulkIndexer.StartSession(ctx)
+	if err != nil {
+		return err
+	}
+	defer session.End()
 
-		default:
-			e.logger.Error(fmt.Sprintf("Drop event: failed to index event: %#v", resp.Error),
-				zap.Int("attempt", attempts),
-				zap.Int("status", resp.Status))
+	var (
+		validationErrs []error // log instead of returning these so that upstream does not retry
+		errs           []error
+	)
+	resourceMetrics := metrics.ResourceMetrics()
+	for i := 0; i < resourceMetrics.Len(); i++ {
+		resourceMetric := resourceMetrics.At(i)
+		resource := resourceMetric.Resource()
+		scopeMetrics := resourceMetric.ScopeMetrics()
+
+		resourceDocs := make(map[string]map[uint32]objmodel.Document)
+
+		for j := 0; j < scopeMetrics.Len(); j++ {
+			scopeMetrics := scopeMetrics.At(j)
+			scope := scopeMetrics.Scope()
+			for k := 0; k < scopeMetrics.Metrics().Len(); k++ {
+				metric := scopeMetrics.Metrics().At(k)
+
+				upsertDataPoint := func(dp dataPoint) error {
+					fIndex, err := e.getMetricDataPointIndex(resource, scope, dp)
+					if err != nil {
+						return err
+					}
+					if _, ok := resourceDocs[fIndex]; !ok {
+						resourceDocs[fIndex] = make(map[uint32]objmodel.Document)
+					}
+
+					if err = e.model.upsertMetricDataPointValue(resourceDocs[fIndex], resource,
+						resourceMetric.SchemaUrl(), scope, scopeMetrics.SchemaUrl(), metric, dp); err != nil {
+						return err
+					}
+					return nil
+				}
+
+				switch metric.Type() {
+				case pmetric.MetricTypeSum:
+					dps := metric.Sum().DataPoints()
+					for l := 0; l < dps.Len(); l++ {
+						dp := dps.At(l)
+						if err := upsertDataPoint(newNumberDataPoint(dp)); err != nil {
+							validationErrs = append(validationErrs, err)
+							continue
+						}
+					}
+				case pmetric.MetricTypeGauge:
+					dps := metric.Gauge().DataPoints()
+					for l := 0; l < dps.Len(); l++ {
+						dp := dps.At(l)
+						if err := upsertDataPoint(newNumberDataPoint(dp)); err != nil {
+							validationErrs = append(validationErrs, err)
+							continue
+						}
+					}
+				case pmetric.MetricTypeExponentialHistogram:
+					if metric.ExponentialHistogram().AggregationTemporality() == pmetric.AggregationTemporalityCumulative {
+						validationErrs = append(validationErrs, fmt.Errorf("dropping cumulative temporality exponential histogram %q", metric.Name()))
+						continue
+					}
+					dps := metric.ExponentialHistogram().DataPoints()
+					for l := 0; l < dps.Len(); l++ {
+						dp := dps.At(l)
+						if err := upsertDataPoint(newExponentialHistogramDataPoint(dp)); err != nil {
+							validationErrs = append(validationErrs, err)
+							continue
+						}
+					}
+				case pmetric.MetricTypeHistogram:
+					if metric.Histogram().AggregationTemporality() == pmetric.AggregationTemporalityCumulative {
+						validationErrs = append(validationErrs, fmt.Errorf("dropping cumulative temporality histogram %q", metric.Name()))
+						continue
+					}
+					dps := metric.Histogram().DataPoints()
+					for l := 0; l < dps.Len(); l++ {
+						dp := dps.At(l)
+						if err := upsertDataPoint(newHistogramDataPoint(dp)); err != nil {
+							validationErrs = append(validationErrs, err)
+							continue
+						}
+					}
+				case pmetric.MetricTypeSummary:
+					dps := metric.Summary().DataPoints()
+					for l := 0; l < dps.Len(); l++ {
+						dp := dps.At(l)
+						if err := upsertDataPoint(newSummaryDataPoint(dp)); err != nil {
+							validationErrs = append(validationErrs, err)
+							continue
+						}
+					}
+				}
+			}
+		}
+
+		if len(validationErrs) > 0 {
+			e.Logger.Warn("validation errors", zap.Error(errors.Join(validationErrs...)))
+		}
+
+		for fIndex, docs := range resourceDocs {
+			for _, doc := range docs {
+				var (
+					docBytes []byte
+					err      error
+				)
+				docBytes, err = e.model.encodeDocument(doc)
+				if err != nil {
+					errs = append(errs, err)
+					continue
+				}
+				if err := session.Add(ctx, fIndex, bytes.NewReader(docBytes), doc.DynamicTemplates()); err != nil {
+					if cerr := ctx.Err(); cerr != nil {
+						return cerr
+					}
+					errs = append(errs, err)
+				}
+			}
 		}
 	}
 
-	return e.bulkIndexer.Add(ctx, item)
+	if err := session.Flush(ctx); err != nil {
+		if cerr := ctx.Err(); cerr != nil {
+			return cerr
+		}
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
 }
 
-// clientLogger implements the estransport.Logger interface
-// that is required by the Elasticsearch client for logging.
-type clientLogger zap.Logger
-
-// LogRoundTrip should not modify the request or response, except for consuming and closing the body.
-// Implementations have to check for nil values in request and response.
-func (cl *clientLogger) LogRoundTrip(requ *http.Request, resp *http.Response, err error, _ time.Time, dur time.Duration) error {
-	zl := (*zap.Logger)(cl)
-	switch {
-	case err == nil && resp != nil:
-		zl.Debug("Request roundtrip completed.",
-			zap.String("path", sanitize.String(requ.URL.Path)),
-			zap.String("method", requ.Method),
-			zap.Duration("duration", dur),
-			zap.String("status", resp.Status))
-
-	case err != nil:
-		zl.Error("Request failed.", zap.NamedError("reason", err))
+func (e *elasticsearchExporter) getMetricDataPointIndex(
+	resource pcommon.Resource,
+	scope pcommon.InstrumentationScope,
+	dataPoint dataPoint,
+) (string, error) {
+	fIndex := e.index
+	if e.dynamicIndex {
+		fIndex = routeDataPoint(dataPoint.Attributes(), scope.Attributes(), resource.Attributes(), fIndex, e.otel, scope.Name())
 	}
 
-	return nil
+	if e.logstashFormat.Enabled {
+		formattedIndex, err := generateIndexWithLogstashFormat(fIndex, &e.logstashFormat, time.Now())
+		if err != nil {
+			return "", err
+		}
+		fIndex = formattedIndex
+	}
+	return fIndex, nil
 }
 
-// RequestBodyEnabled makes the client pass a copy of request body to the logger.
-func (*clientLogger) RequestBodyEnabled() bool {
-	// TODO: introduce setting log the bodies for more detailed debug logs
-	return false
-}
+func (e *elasticsearchExporter) pushTraceData(
+	ctx context.Context,
+	td ptrace.Traces,
+) error {
+	e.wg.Add(1)
+	defer e.wg.Done()
 
-// ResponseBodyEnabled makes the client pass a copy of response body to the logger.
-func (*clientLogger) ResponseBodyEnabled() bool {
-	// TODO: introduce setting log the bodies for more detailed debug logs
-	return false
-}
-
-func newElasticsearchClient(logger *zap.Logger, config *Config) (*esClientCurrent, error) {
-	tlsCfg, err := config.TLSClientSetting.LoadTLSConfig()
+	session, err := e.bulkIndexer.StartSession(ctx)
 	if err != nil {
-		return nil, err
+		return err
+	}
+	defer session.End()
+
+	var errs []error
+	resourceSpans := td.ResourceSpans()
+	for i := 0; i < resourceSpans.Len(); i++ {
+		il := resourceSpans.At(i)
+		resource := il.Resource()
+		scopeSpans := il.ScopeSpans()
+		for j := 0; j < scopeSpans.Len(); j++ {
+			scopeSpan := scopeSpans.At(j)
+			scope := scopeSpan.Scope()
+			spans := scopeSpan.Spans()
+			for k := 0; k < spans.Len(); k++ {
+				span := spans.At(k)
+				if err := e.pushTraceRecord(ctx, resource, il.SchemaUrl(), span, scope, scopeSpan.SchemaUrl(), session); err != nil {
+					if cerr := ctx.Err(); cerr != nil {
+						return cerr
+					}
+					errs = append(errs, err)
+				}
+				for ii := 0; ii < span.Events().Len(); ii++ {
+					spanEvent := span.Events().At(ii)
+					if err := e.pushSpanEvent(ctx, resource, il.SchemaUrl(), span, spanEvent, scope, scopeSpan.SchemaUrl(), session); err != nil {
+						errs = append(errs, err)
+					}
+				}
+			}
+		}
 	}
 
-	transport := newTransport(config, tlsCfg)
-
-	var headers http.Header
-	for k, v := range config.Headers {
-		headers.Add(k, v)
+	if err := session.Flush(ctx); err != nil {
+		if cerr := ctx.Err(); cerr != nil {
+			return cerr
+		}
+		errs = append(errs, err)
 	}
-
-	// TODO: validate settings:
-	//  - try to parse address and validate scheme (address must be a valid URL)
-	//  - check if cloud ID is valid
-
-	// maxRetries configures the maximum number of event publishing attempts,
-	// including the first send and additional retries.
-	maxRetries := config.Retry.MaxRequests - 1
-	retryDisabled := !config.Retry.Enabled || maxRetries <= 0
-	if retryDisabled {
-		maxRetries = 0
-	}
-
-	return elasticsearch7.NewClient(esConfigCurrent{
-		Transport: transport,
-
-		// configure connection setup
-		Addresses: config.Endpoints,
-		CloudID:   config.CloudID,
-		Username:  config.Authentication.User,
-		Password:  config.Authentication.Password,
-		APIKey:    config.Authentication.APIKey,
-		Header:    headers,
-
-		// configure retry behavior
-		RetryOnStatus:        retryOnStatus,
-		DisableRetry:         retryDisabled,
-		EnableRetryOnTimeout: config.Retry.Enabled,
-		MaxRetries:           maxRetries,
-		RetryBackoff:         createElasticsearchBackoffFunc(&config.Retry),
-
-		// configure sniffing
-		DiscoverNodesOnStart:  config.Discovery.OnStart,
-		DiscoverNodesInterval: config.Discovery.Interval,
-
-		// configure internal metrics reporting and logging
-		EnableMetrics:     false, // TODO
-		EnableDebugLogger: false, // TODO
-		Logger:            (*clientLogger)(logger),
-	})
+	return errors.Join(errs...)
 }
 
-func newTransport(config *Config, tlsCfg *tls.Config) *http.Transport {
-	transport := http.DefaultTransport.(*http.Transport).Clone()
-	if tlsCfg != nil {
-		transport.TLSClientConfig = tlsCfg
-	}
-	if config.ReadBufferSize > 0 {
-		transport.ReadBufferSize = config.ReadBufferSize
-	}
-	if config.WriteBufferSize > 0 {
-		transport.WriteBufferSize = config.WriteBufferSize
+func (e *elasticsearchExporter) pushTraceRecord(
+	ctx context.Context,
+	resource pcommon.Resource,
+	resourceSchemaURL string,
+	span ptrace.Span,
+	scope pcommon.InstrumentationScope,
+	scopeSchemaURL string,
+	bulkIndexerSession bulkIndexerSession,
+) error {
+	fIndex := e.index
+	if e.dynamicIndex {
+		fIndex = routeSpan(span.Attributes(), scope.Attributes(), resource.Attributes(), fIndex, e.otel, span.Name())
 	}
 
-	return transport
+	if e.logstashFormat.Enabled {
+		formattedIndex, err := generateIndexWithLogstashFormat(fIndex, &e.logstashFormat, time.Now())
+		if err != nil {
+			return err
+		}
+		fIndex = formattedIndex
+	}
+
+	document, err := e.model.encodeSpan(resource, resourceSchemaURL, span, scope, scopeSchemaURL)
+	if err != nil {
+		return fmt.Errorf("failed to encode trace record: %w", err)
+	}
+	return bulkIndexerSession.Add(ctx, fIndex, bytes.NewReader(document), nil)
 }
 
-func newBulkIndexer(logger *zap.Logger, client *elasticsearch7.Client, config *Config) (esBulkIndexerCurrent, error) {
-	// TODO: add debug logger
-	return esutil7.NewBulkIndexer(esutil7.BulkIndexerConfig{
-		NumWorkers:    config.NumWorkers,
-		FlushBytes:    config.Flush.Bytes,
-		FlushInterval: config.Flush.Interval,
-		Client:        client,
-		Pipeline:      config.Pipeline,
-		Timeout:       config.Timeout,
+func (e *elasticsearchExporter) pushSpanEvent(
+	ctx context.Context,
+	resource pcommon.Resource,
+	resourceSchemaURL string,
+	span ptrace.Span,
+	spanEvent ptrace.SpanEvent,
+	scope pcommon.InstrumentationScope,
+	scopeSchemaURL string,
+	bulkIndexerSession bulkIndexerSession,
+) error {
+	fIndex := e.index
+	if e.dynamicIndex {
+		fIndex = routeSpanEvent(spanEvent.Attributes(), scope.Attributes(), resource.Attributes(), fIndex, e.otel, scope.Name())
+	}
 
-		OnError: func(_ context.Context, err error) {
-			logger.Error(fmt.Sprintf("Bulk indexer error: %v", err))
-		},
-	})
-}
+	if e.logstashFormat.Enabled {
+		formattedIndex, err := generateIndexWithLogstashFormat(fIndex, &e.logstashFormat, time.Now())
+		if err != nil {
+			return err
+		}
+		fIndex = formattedIndex
+	}
 
-func createElasticsearchBackoffFunc(config *RetrySettings) func(int) time.Duration {
-	if !config.Enabled {
+	document := e.model.encodeSpanEvent(resource, resourceSchemaURL, span, spanEvent, scope, scopeSchemaURL)
+	if document == nil {
 		return nil
 	}
-
-	expBackoff := backoff.NewExponentialBackOff()
-	if config.InitialInterval > 0 {
-		expBackoff.InitialInterval = config.InitialInterval
+	docBytes, err := e.model.encodeDocument(*document)
+	if err != nil {
+		return err
 	}
-	if config.MaxInterval > 0 {
-		expBackoff.MaxInterval = config.MaxInterval
-	}
-	expBackoff.Reset()
-
-	return func(attempts int) time.Duration {
-		if attempts == 1 {
-			expBackoff.Reset()
-		}
-
-		return expBackoff.NextBackOff()
-	}
-}
-
-func shouldRetryEvent(status int) bool {
-	for _, retryable := range retryOnStatus {
-		if status == retryable {
-			return true
-		}
-	}
-	return false
+	return bulkIndexerSession.Add(ctx, fIndex, bytes.NewReader(docBytes), nil)
 }

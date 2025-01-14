@@ -1,40 +1,53 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//       http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
 package internal // import "github.com/open-telemetry/opentelemetry-collector-contrib/receiver/hostmetricsreceiver/internal"
 
 import (
 	"context"
 
-	"go.opentelemetry.io/collector/receiver/scraperhelper"
-	"go.uber.org/zap"
+	"github.com/shirou/gopsutil/v4/common"
+	"go.opentelemetry.io/collector/component"
+	"go.opentelemetry.io/collector/pdata/pmetric"
+	"go.opentelemetry.io/collector/receiver"
+	"go.opentelemetry.io/collector/scraper"
 )
 
 // ScraperFactory can create a MetricScraper.
 type ScraperFactory interface {
 	// CreateDefaultConfig creates the default configuration for the Scraper.
-	CreateDefaultConfig() Config
+	CreateDefaultConfig() component.Config
 
 	// CreateMetricsScraper creates a scraper based on this config.
 	// If the config is not valid, error will be returned instead.
-	CreateMetricsScraper(ctx context.Context, logger *zap.Logger, cfg Config) (scraperhelper.Scraper, error)
+	CreateMetricsScraper(ctx context.Context, settings receiver.Settings, cfg component.Config) (scraper.Metrics, error)
 }
 
 // Config is the configuration of a scraper.
 type Config interface {
+	SetRootPath(rootPath string)
 }
 
-// ConfigSettings provides common settings for scraper configuration.
-type ConfigSettings struct {
+type EnvVarScraper struct {
+	delegate scraper.Metrics
+	envMap   common.EnvMap
+}
+
+func NewEnvVarScraper(delegate scraper.Metrics, envMap common.EnvMap) scraper.Metrics {
+	return &EnvVarScraper{delegate: delegate, envMap: envMap}
+}
+
+func (evs *EnvVarScraper) Start(ctx context.Context, host component.Host) error {
+	ctx = context.WithValue(ctx, common.EnvKey, evs.envMap)
+	return evs.delegate.Start(ctx, host)
+}
+
+func (evs *EnvVarScraper) ScrapeMetrics(ctx context.Context) (pmetric.Metrics, error) {
+	ctx = context.WithValue(ctx, common.EnvKey, evs.envMap)
+	return evs.delegate.ScrapeMetrics(ctx)
+}
+
+func (evs *EnvVarScraper) Shutdown(ctx context.Context) error {
+	ctx = context.WithValue(ctx, common.EnvKey, evs.envMap)
+	return evs.delegate.Shutdown(ctx)
 }

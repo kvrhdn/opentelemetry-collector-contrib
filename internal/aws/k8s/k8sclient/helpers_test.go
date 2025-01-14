@@ -1,32 +1,19 @@
-// Copyright  OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
 
 package k8sclient
 
 import (
-	"io/ioutil"
 	"os"
 	"testing"
 
+	"github.com/stretchr/testify/require"
 	"k8s.io/apimachinery/pkg/runtime"
 )
 
-type mockReflectorSyncChecker struct {
-}
+type mockReflectorSyncChecker struct{}
 
 func (m *mockReflectorSyncChecker) Check(_ cacheReflector, _ string) {
-
 }
 
 var kubeConfigPath string
@@ -55,21 +42,17 @@ users:
 - name: foo-user
   user:
     exec:
-      apiVersion: client.authentication.k8s.io/v1alpha1
+      apiVersion: client.authentication.k8s.io/v1beta1
       args:
       - arg-1
       - arg-2
       command: foo-command
       provideClusterInfo: true
 `
-	tmpfile, err := ioutil.TempFile("", "kubeconfig")
-	if err != nil {
-		t.Error(err)
-	}
-	if err := ioutil.WriteFile(tmpfile.Name(), []byte(content), 0600); err != nil {
-		t.Error(err)
-	}
-	//overwrite the default kube config path
+	tmpfile, err := os.CreateTemp("", "kubeconfig")
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(tmpfile.Name(), []byte(content), 0o600))
+	// overwrite the default kube config path
 	kubeConfigPath = tmpfile.Name()
 	return kubeConfigPath
 }
@@ -79,8 +62,8 @@ func removeTempKubeConfig() {
 	kubeConfigPath = ""
 }
 
-func convertToInterfaceArray(objArray []runtime.Object) []interface{} {
-	array := make([]interface{}, len(objArray))
+func convertToInterfaceArray(objArray []runtime.Object) []any {
+	array := make([]any, len(objArray))
 	for i := range array {
 		array[i] = objArray[i]
 	}
